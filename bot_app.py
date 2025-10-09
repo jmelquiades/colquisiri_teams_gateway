@@ -4,19 +4,27 @@
 # 1) Recibe Activities en /api/messages
 # 2) Autentica con el header Authorization que manda Bot Service
 # 3) Llama a tu backend (/n2sql/run)
-# 4) Responde en el mismo hilo del canal (Web Chat/Teams) en Markdown
+# 4) Responde en el mismo hilo (Web Chat/Teams) en Markdown
+# Incluye diagnósticos: /diag/env, /diag/msal, /diag/sdk-token
 # -----------------------------------------------------------------------------
 
 import os
 import json
+from typing import List, Dict, Any
+
 import httpx
 import msal
-from typing import List, Dict, Any, Optional
-
 from fastapi import FastAPI, Request, Response
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
 from botbuilder.schema import Activity, ActivityTypes, ChannelAccount
 from botframework.connector.auth import MicrosoftAppCredentials
+
+# -------------------------------------------------------------------
+# Fuerza entorno "Public" para evitar rutas Gov/DoD en el SDK.
+# (Inocuo si ya estás en Public; previene tokens sin 'access_token'.)
+# -------------------------------------------------------------------
+os.environ["ChannelService"] = "Public"
+os.environ["CHANNEL_SERVICE"] = "Public"
 
 # -----------------------------
 # CONFIG (variables de entorno)
@@ -25,16 +33,16 @@ from botframework.connector.auth import MicrosoftAppCredentials
 APP_ID  = os.getenv("MICROSOFT_APP_ID") or os.getenv("MicrosoftAppId")
 APP_PWD = os.getenv("MICROSOFT_APP_PASSWORD") or os.getenv("MicrosoftAppPassword")
 
-# Tipo de App y Tenant para construir la authority correcta del token saliente
-# - SingleTenant: requiere MicrosoftAppTenantId
-# - MultiTenant: no requiere TenantId
+# Tipo de app y Tenant:
+#  - SingleTenant -> requiere MicrosoftAppTenantId
+#  - MultiTenant  -> sin TenantId
 APP_TYPE = os.getenv("MicrosoftAppType", "MultiTenant")  # "SingleTenant" | "MultiTenant"
 TENANT   = os.getenv("MicrosoftAppTenantId")
 
 # Tu backend ya desplegado (donde vive /n2sql/run)
 BACKEND_URL = os.getenv("BACKEND_URL", "https://admin-assistant-npsd.onrender.com")
 
-# Modo diagnóstico: si pones REPLY_MODE=silent, arma el markdown pero no envía (útil para aislar problemas de token)
+# Modo diagnóstico: si pones REPLY_MODE=silent, arma el markdown pero no envía
 REPLY_MODE = os.getenv("REPLY_MODE", "active")  # "active" | "silent"
 
 
@@ -44,10 +52,8 @@ REPLY_MODE = os.getenv("REPLY_MODE", "active")  # "active" | "silent"
 app = FastAPI(title="Teams Gateway")
 
 if not APP_ID or not APP_PWD:
-    # Mensaje de ayuda en logs si faltan credenciales
     print("[gw] WARNING: faltan MICROSOFT_APP_ID/MicrosoftAppId o MICROSOFT_APP_PASSWORD/MicrosoftAppPassword.")
 
-# El adapter del Bot Framework validará el Authorization entrante
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PWD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
@@ -56,9 +62,7 @@ adapter = BotFrameworkAdapter(adapter_settings)
 # HELPERS
 # -----------------------------
 def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10) -> str:
-    """
-    Construye una tablita Markdown con las primeras 'limit' filas.
-    """
+    """Construye una tablita Markdown con las primeras 'limit' filas."""
     if not rows:
         return "_(sin resultados)_"
     header = "| " + " | ".join(cols) + " |"
@@ -70,11 +74,9 @@ def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10
 async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = 10):
     """
     Envía un mensaje Markdown de vuelta al canal.
-
-    - Antes de responder, "confiamos" el serviceUrl para que el SDK pueda enviar el reply.
-    - Si REPLY_MODE = "silent", no envía; solo imprime en logs (útil para depurar problemas de token saliente).
+    - Antes de responder, "confiamos" el serviceUrl (recomendado por MS).
+    - Si REPLY_MODE = "silent", imprime el markdown en logs y no envía.
     """
-    # Confiar el serviceUrl (recomendado por MS para evitar bloqueos al responder)
     su = getattr(context.activity, "service_url", None)
     if su:
         try:
@@ -82,8 +84,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
         except Exception as e:
             print(f"[gw] WARN trust_service_url: {e}")
 
-    table_md = _markdown_table(cols, rows, limit)
-    md = f"{title}\n\n{table_md}"
+    md = f"{title}\n\n{_markdown_table(cols, rows, limit)}"
 
     if REPLY_MODE.lower() == "silent":
         print("[gw] SILENT MODE — markdown construido (no enviado):")
@@ -95,7 +96,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
     except Exception as e:
         # Si fallara al enviar (p. ej., token saliente), dejamos huella clara
         print(f"[gw] ERROR send_activity: {repr(e)}")
-        # Aquí no relanzamos para no romper la pipeline; Bot Service ya recibió 200 de nuestro endpoint.
+        # No relanzamos para no romper la pipeline; Bot Service ya recibió 200.
 
 
 async def on_message(context: TurnContext):
@@ -123,7 +124,6 @@ async def on_message(context: TurnContext):
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{BACKEND_URL}/n2sql/run", json=payload)
             if r.status_code >= 400:
-                # Si el backend responde error, informamos al usuario
                 await context.send_activity(f"⚠️ Backend: {r.text}")
                 return
             data = r.json()
@@ -145,16 +145,12 @@ async def on_message(context: TurnContext):
 # -----------------------------
 @app.get("/")
 def root():
-    """
-    Ping básico. Útil para despertar el servicio en Render.
-    """
+    """Ping básico. Útil para despertar el servicio en Render."""
     return {"ok": True, "service": "teams-gateway"}
 
 @app.get("/health")
 def health():
-    """
-    Health check para Render.
-    """
+    """Health check para Render."""
     return {"ok": True}
 
 @app.get("/diag/env")
@@ -178,34 +174,49 @@ def diag_env():
 def diag_msal():
     """
     Prueba inequívoca de token saliente contra AAD (fuera del SDK).
-    Si devuelve ok: true → el AppId/Secret/Authority están correctos.
+    Si devuelve ok: true → AppId/Secret/Authority están correctos.
     """
     if not APP_ID or not APP_PWD:
         return {"ok": False, "error": "Faltan AppId/Secret"}
 
-    # Authority según tipo de app
     authority = (
         f"https://login.microsoftonline.com/{TENANT}"
         if (APP_TYPE == "SingleTenant" and TENANT)
         else "https://login.microsoftonline.com/organizations"
     )
-
     cca = msal.ConfidentialClientApplication(
         client_id=APP_ID,
         client_credential=APP_PWD,
         authority=authority,
     )
-    # Scope correcto para Bot Framework
     res = cca.acquire_token_for_client(scopes=["https://api.botframework.com/.default"])
     if "access_token" in res:
         return {"ok": True, "token_type": res.get("token_type", "Bearer"), "expires_in": res.get("expires_in")}
     return {"ok": False, "aad_error": res.get("error"), "aad_error_description": res.get("error_description")}
 
+@app.get("/diag/sdk-token")
+def diag_sdk_token():
+    """
+    Pide un token usando el MISMO mecanismo del SDK (cercano a send_activity).
+    Si aquí es ok: true, el reply debería funcionar.
+    """
+    try:
+        creds = MicrosoftAppCredentials(
+            app_id=APP_ID,
+            password=APP_PWD,
+            channel_auth_tenant=TENANT if (APP_TYPE == "SingleTenant" and TENANT) else None,
+            oauth_scope="https://api.botframework.com/.default",
+        )
+        tok = creds.get_access_token()  # string "Bearer eyJ..." o similar
+        ok = bool(tok)
+        prefix = tok[:12] if tok else ""
+        return {"ok": ok, "prefix": prefix}
+    except Exception as e:
+        return {"ok": False, "error": repr(e)}
+
 @app.options("/api/messages")
 def options_messages():
-    """
-    Algunos entornos podrían disparar OPTIONS. Lo aceptamos con 200.
-    """
+    """Algunos entornos disparan OPTIONS. Lo aceptamos con 200."""
     return Response(status_code=200)
 
 @app.post("/api/messages")
