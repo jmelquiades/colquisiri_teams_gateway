@@ -1,4 +1,3 @@
-cat > bot_app.py <<'EOF'
 # -----------------------------------------------------------------------------
 # Gateway para Microsoft Bot Framework (Web Chat/Teams)
 # - Recibe /api/messages (Adapter SDK 4.14.3 valida token entrante)
@@ -324,4 +323,3 @@ async def api_messages(req: Request):
 
     await adapter.process_activity(activity, auth_header, aux)
     return Response(status_code=200, content=json.dumps({"ok": True}), media_type="application/json")
-EOF
