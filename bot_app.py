@@ -2,7 +2,7 @@
 # Gateway para Microsoft Bot Framework (Web Chat/Teams)
 # - Recibe /api/messages (Adapter SDK 4.14.3 valida token entrante)
 # - Llama al backend /n2sql/run con intent + filtros detectados
-# - Responde con ConnectorClient.send_to_conversation (SDK 4.14.3: NO await)
+# - RESPONDE SIEMPRE con ConnectorClient.send_to_conversation (NUNCA send_activity)
 # - Memoria corta por conversación para refinamientos ("y de todo el mes?")
 # - Diags: /health, /diag/env, /diag/msal, /diag/sdk-token
 # -----------------------------------------------------------------------------
@@ -48,7 +48,9 @@ if not APP_ID or not APP_PWD:
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PWD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
-# Util: tabla markdown
+# -----------------------------------------------------------------------------
+# Utils: construir tabla Markdown
+# -----------------------------------------------------------------------------
 def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = PAGE_LIMIT) -> str:
     if not rows:
         return "_(sin resultados)_"
@@ -57,7 +59,78 @@ def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = PA
     body   = "\n".join("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |" for r in rows[:limit])
     return f"{header}\n{sep}\n{body}\n\n_Mostrando hasta {limit} filas._"
 
+# -----------------------------------------------------------------------------
+# Utils: crear ConnectorClient + metadatos del Activity
+# -----------------------------------------------------------------------------
+def _connector_and_meta(context: TurnContext):
+    """Devuelve (connector, conv_id, bot_id, bot_name, usr_id, usr_name, su, channel_id, locale)"""
+    act_in = context.activity
+    su           = getattr(act_in, "service_url", None)
+    channel_id   = getattr(act_in, "channel_id", None)
+    conv_in      = getattr(act_in, "conversation", None)
+    conv_id      = conv_in.id if conv_in else None
+    user_acc     = getattr(act_in, "from_property", None)
+    bot_acc      = getattr(act_in, "recipient", None)
+    locale       = getattr(act_in, "locale", None) or DEFAULT_LOCALE
+
+    # Confiar serviceUrl (recomendado por Microsoft)
+    if su:
+        try:
+            MicrosoftAppCredentials.trust_service_url(su)
+        except Exception as e:
+            print(f"[gw] WARN trust_service_url: {e}")
+
+    # Identidades
+    bot_id   = getattr(bot_acc, "id", None) or APP_ID
+    bot_name = getattr(bot_acc, "name", None) or "Bot"
+    usr_id   = getattr(user_acc, "id", None) or "user"
+    usr_name = getattr(user_acc, "name", None) or "Usuario"
+
+    # Credenciales salientes (scope .default + tenant si aplica)
+    creds = MicrosoftAppCredentials(
+        app_id=APP_ID,
+        password=APP_PWD,
+        channel_auth_tenant=TENANT if (APP_TYPE == "SingleTenant" and TENANT) else None,
+        oauth_scope="https://api.botframework.com/.default",
+    )
+    connector = ConnectorClient(credentials=creds, base_url=su)
+    return connector, conv_id, bot_id, bot_name, usr_id, usr_name, su, channel_id, locale
+
+# -----------------------------------------------------------------------------
+# Utils: enviar texto simple SIEMPRE con ConnectorClient (nunca send_activity)
+# -----------------------------------------------------------------------------
+def _send_text(context: TurnContext, text: str):
+    connector, conv_id, bot_id, bot_name, usr_id, usr_name, su, channel_id, locale = _connector_and_meta(context)
+
+    if REPLY_MODE.lower() == "silent":
+        print("[gw] SILENT MODE — text (no enviado):")
+        print((text or "")[:1000])
+        return
+
+    if not (su and channel_id and conv_id and bot_id and usr_id):
+        print("[gw] ERROR: faltan datos de canal para responder (send_text).")
+        return
+
+    activity = {
+        "type": "message",
+        "channelId": channel_id,
+        "serviceUrl": su,
+        "conversation": {"id": conv_id},
+        "from": {"id": bot_id, "name": bot_name, "role": "bot"},
+        "recipient": {"id": usr_id, "name": usr_name, "role": "user"},
+        "textFormat": "markdown",
+        "text": text,
+        "locale": locale,
+    }
+    try:
+        # SDK 4.14.3: llamada sin await
+        connector.conversations.send_to_conversation(conversation_id=conv_id, activity=activity)
+    except Exception as e:
+        print(f"[gw] ERROR send_to_conversation (text): {repr(e)}")
+
+# -----------------------------------------------------------------------------
 # NLU ligero: detección de intent
+# -----------------------------------------------------------------------------
 def detect_intent(text: str, last_intent: str | None = None) -> str:
     t = (text or "").lower().strip()
 
@@ -89,7 +162,9 @@ def detect_intent(text: str, last_intent: str | None = None) -> str:
 
     return "help"
 
+# -----------------------------------------------------------------------------
 # NLU ligero: extracción de filtros (día del mes, rango próximas semanas/días)
+# -----------------------------------------------------------------------------
 SPAN_NUMS = {"uno":1,"una":1,"dos":2,"tres":3,"cuatro":4,"cinco":5,"seis":6,"siete":7,"ocho":8,"nueve":9,"diez":10,
              "once":11,"doce":12,"trece":13,"catorce":14,"quince":15}
 
@@ -140,52 +215,22 @@ def _help_text() -> str:
         "_También puedo entender: `las del 13`, `y de todo el mes?`, `próximas dos semanas`._"
     )
 
-# Respuesta al canal con ConnectorClient (SDK 4.14.3)
-async def _reply_markdown(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = PAGE_LIMIT):
-    act_in = context.activity
-    su           = getattr(act_in, "service_url", None)
-    channel_id   = getattr(act_in, "channel_id", None)
-    conv_in      = getattr(act_in, "conversation", None)
-    conv_id      = conv_in.id if conv_in else None
-    user_acc     = getattr(act_in, "from_property", None)
-    bot_acc      = getattr(act_in, "recipient", None)
-    locale       = getattr(act_in, "locale", None) or DEFAULT_LOCALE
-
-    # Confiar serviceUrl
-    if su:
-        try:
-            MicrosoftAppCredentials.trust_service_url(su)
-        except Exception as e:
-            print(f"[gw] WARN trust_service_url: {e}")
-
-    md = f"{title}\n\n{_markdown_table(cols, rows, limit)}"
+# -----------------------------------------------------------------------------
+# Respuestas Markdown SIEMPRE con ConnectorClient
+# -----------------------------------------------------------------------------
+def _send_markdown(context: TurnContext, md: str):
+    connector, conv_id, bot_id, bot_name, usr_id, usr_name, su, channel_id, locale = _connector_and_meta(context)
 
     if REPLY_MODE.lower() == "silent":
         print("[gw] SILENT MODE — markdown (no enviado):")
         print(md[:2000])
         return
 
-    if not (su and channel_id and conv_id and user_acc and bot_acc):
-        try:
-            await context.send_activity("⚠️ No se encontró información suficiente del canal para responder.")
-        except Exception as e:
-            print(f"[gw] ERROR send_activity (fallback): {repr(e)}")
+    if not (su and channel_id and conv_id and bot_id and usr_id):
+        print("[gw] ERROR: faltan datos de canal para responder (markdown).")
         return
 
-    bot_id   = getattr(bot_acc, "id", None) or APP_ID
-    bot_name = getattr(bot_acc, "name", None) or "Bot"
-    usr_id   = getattr(user_acc, "id", None) or "user"
-    usr_name = getattr(user_acc, "name", None) or "Usuario"
-
-    creds = MicrosoftAppCredentials(
-        app_id=APP_ID,
-        password=APP_PWD,
-        channel_auth_tenant=TENANT if (APP_TYPE == "SingleTenant" and TENANT) else None,
-        oauth_scope="https://api.botframework.com/.default",
-    )
-    connector = ConnectorClient(credentials=creds, base_url=su)
-
-    reply_activity = {
+    activity = {
         "type": "message",
         "channelId": channel_id,
         "serviceUrl": su,
@@ -196,17 +241,18 @@ async def _reply_markdown(context: TurnContext, title: str, cols: List[str], row
         "text": md,
         "locale": locale,
     }
-
     try:
-        connector.conversations.send_to_conversation(conversation_id=conv_id, activity=reply_activity)
+        connector.conversations.send_to_conversation(conversation_id=conv_id, activity=activity)
     except Exception as e:
-        print(f"[gw] ERROR ConnectorClient.send_to_conversation: {repr(e)}")
-        try:
-            await context.send_activity("⚠️ No pude enviar la respuesta por el canal. Intenta de nuevo.")
-        except Exception as e2:
-            print(f"[gw] ERROR send_activity (fallback tras ConnectorClient): {repr(e2)}")
+        print(f"[gw] ERROR send_to_conversation (markdown): {repr(e)}")
 
+def _reply_markdown(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = PAGE_LIMIT):
+    md = f"{title}\n\n{_markdown_table(cols, rows, limit)}"
+    _send_markdown(context, md)
+
+# -----------------------------------------------------------------------------
 # Handler principal
+# -----------------------------------------------------------------------------
 async def on_message(context: TurnContext):
     text = (context.activity.text or "").strip()
     conv_id = getattr(getattr(context.activity, "conversation", None), "id", "default")
@@ -216,7 +262,7 @@ async def on_message(context: TurnContext):
 
     intent = detect_intent(text, state.get("last_intent"))
     if intent == "help":
-        await context.send_activity(_help_text())
+        _send_text(context, _help_text())
         return
 
     filters = extract_filters(text, intent)
@@ -228,16 +274,17 @@ async def on_message(context: TurnContext):
         "filters": filters,
     }
 
+    # Llamada al backend N2SQL
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{BACKEND_URL}/n2sql/run", json=payload)
             if r.status_code >= 400:
-                await context.send_activity(f"⚠️ Backend: {r.text}")
+                _send_text(context, f"⚠️ Backend: {r.text}")
                 return
             data = r.json()
     except Exception as e:
         print(f"[gw] ERROR llamando backend: {repr(e)}")
-        await context.send_activity("⚠️ Ocurrió un problema al consultar el backend.")
+        _send_text(context, "⚠️ Ocurrió un problema al consultar el backend.")
         return
 
     cols: List[str] = data.get("columns", []) or []
@@ -247,9 +294,11 @@ async def on_message(context: TurnContext):
 
     CONV_STATE[conv_id] = {"last_intent": intent, "last_filters": filters}
 
-    await _reply_markdown(context, title, cols, rows, limit=PAGE_LIMIT)
+    _reply_markdown(context, title, cols, rows, limit=PAGE_LIMIT)
 
+# -----------------------------------------------------------------------------
 # Rutas HTTP (health/diag + BF)
+# -----------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {"ok": True, "service": "teams-gateway"}
@@ -319,6 +368,7 @@ async def api_messages(req: Request):
         if activity.type == ActivityTypes.message:
             await on_message(turn_context)
         else:
+            # otros tipos se ignoran para este MVP
             pass
 
     await adapter.process_activity(activity, auth_header, aux)
