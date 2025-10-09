@@ -1,5 +1,6 @@
 # bot_app.py
 import os, json
+import msal
 import httpx
 from typing import Dict, Any
 from fastapi import FastAPI, Request, Response
@@ -74,3 +75,42 @@ async def api_messages(req: Request):
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# bot_app.py
+@app.get("/diag/env")
+def diag_env():
+    aid = os.getenv("MICROSOFT_APP_ID") or os.getenv("MicrosoftAppId") or ""
+    apw = os.getenv("MICROSOFT_APP_PASSWORD") or os.getenv("MicrosoftAppPassword") or ""
+    return {
+        "has_app_id": bool(aid),
+        "app_id_len": len(aid),
+        "has_secret": bool(apw),
+        "secret_len": len(apw),  # solo longitud, sin exponerlo
+    }
+
+# bot_app.py (añade)
+import msal
+
+@app.get("/diag/msal")
+def diag_msal():
+    app_id = os.getenv("MICROSOFT_APP_ID") or os.getenv("MicrosoftAppId")
+    secret = os.getenv("MICROSOFT_APP_PASSWORD") or os.getenv("MicrosoftAppPassword")
+    app_type = os.getenv("MicrosoftAppType", "MultiTenant")
+    tenant = os.getenv("MicrosoftAppTenantId")  # puede ser None
+
+    if not app_id or not secret:
+        return {"ok": False, "error": "Faltan MICROSOFT_APP_ID / MICROSOFT_APP_PASSWORD"}
+
+    # authority según tipo
+    authority = f"https://login.microsoftonline.com/{tenant}" if (app_type == "SingleTenant" and tenant) else "https://login.microsoftonline.com/organizations"
+
+    cca = msal.ConfidentialClientApplication(client_id=app_id, client_credential=secret, authority=authority)
+    # El scope correcto para Bot Framework:
+    result = cca.acquire_token_for_client(scopes=["https://api.botframework.com/.default"])
+
+    if "access_token" in result:
+        return {"ok": True, "token_type": result.get("token_type", "Bearer"), "expires_in": result.get("expires_in")}
+    else:
+        # devolvemos mensaje de error de AAD (sin secretos)
+        return {"ok": False, "aad_error": result.get("error"), "aad_error_description": result.get("error_description")}
