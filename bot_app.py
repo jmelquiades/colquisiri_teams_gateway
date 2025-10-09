@@ -1,12 +1,10 @@
 # bot_app.py
 # -----------------------------------------------------------------------------
 # Gateway para Microsoft Bot Framework (Web Chat/Teams)
-# - Recibe /api/messages, valida Authorization entrante con el Adapter
+# - Recibe /api/messages, valida Authorization entrante con el Adapter (SDK 4.14.3)
 # - Llama a tu backend /n2sql/run
-# - Responde en el canal (Teams/Web Chat) con Markdown
-# - Usa ConnectorClient para la respuesta (token saliente con scope correcto)
-# - Endpoints de diagnóstico: /diag/env, /diag/msal, /diag/sdk-token
-# - Compatible con SDK 4.14.3
+# - Responde en el canal usando ConnectorClient (token saliente con scope .default)
+# - Endpoints: /health, /diag/env, /diag/msal, /diag/sdk-token
 # -----------------------------------------------------------------------------
 
 import os
@@ -19,8 +17,8 @@ from fastapi import FastAPI, Request, Response
 
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
 from botbuilder.schema import Activity, ActivityTypes, ChannelAccount
-from botframework.connector import ConnectorClient                          # ✅ envío directo
-from botframework.connector.auth import MicrosoftAppCredentials, AppCredentials
+from botframework.connector import ConnectorClient
+from botframework.connector.auth import MicrosoftAppCredentials
 
 # -----------------------------------------------------------------------------
 # 0) Contexto de nube: fuerza "Public" (evita rutas Gov/DoD que rompen el token)
@@ -31,7 +29,6 @@ os.environ["CHANNEL_SERVICE"] = "Public"
 # -----------------------------------------------------------------------------
 # 1) Configuración (variables de entorno)
 # -----------------------------------------------------------------------------
-# Doble nombre por compatibilidad con variantes del SDK
 APP_ID  = os.getenv("MICROSOFT_APP_ID") or os.getenv("MicrosoftAppId")
 APP_PWD = os.getenv("MICROSOFT_APP_PASSWORD") or os.getenv("MicrosoftAppPassword")
 
@@ -47,27 +44,8 @@ BACKEND_URL = os.getenv("BACKEND_URL", "https://admin-assistant-npsd.onrender.co
 # Modo diagnóstico: "silent" arma el Markdown pero no envía (útil para aislar)
 REPLY_MODE  = os.getenv("REPLY_MODE", "active")  # "active" | "silent"
 
-
 # -----------------------------------------------------------------------------
-# 2) Monkey-patch suave: garantizar scope/tenant en credenciales internas del SDK
-#    (SDK 4.14.3 no acepta 'oauth_scope' en AdapterSettings; así unificamos)
-# -----------------------------------------------------------------------------
-_ORIG_APP_CRED_INIT = AppCredentials.__init__
-
-def _patched_appcred_init(self, app_id: str, password: str, *args, **kwargs):
-    # Scope correcto para Bot Framework OAuth v2
-    if not kwargs.get("oauth_scope"):
-        kwargs["oauth_scope"] = "https://api.botframework.com/.default"
-    # Tenant por defecto si eres SingleTenant
-    if "channel_auth_tenant" not in kwargs and APP_TYPE == "SingleTenant" and TENANT:
-        kwargs["channel_auth_tenant"] = TENANT
-    return _ORIG_APP_CRED_INIT(self, app_id, password, *args, **kwargs)
-
-AppCredentials.__init__ = _patched_appcred_init  # aplicar antes de crear el adapter
-
-
-# -----------------------------------------------------------------------------
-# 3) FastAPI + Adapter (sin kwargs no soportados por 4.14.3)
+# 2) FastAPI + Adapter (SDK 4.14.3 sin kwargs extra)
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Teams Gateway")
 
@@ -77,9 +55,8 @@ if not APP_ID or not APP_PWD:
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PWD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
-
 # -----------------------------------------------------------------------------
-# 4) Helpers de presentación
+# 3) Helpers de presentación
 # -----------------------------------------------------------------------------
 def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10) -> str:
     """
@@ -92,7 +69,6 @@ def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10
     body   = "\n".join("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |" for r in rows[:limit])
     return f"{header}\n{sep}\n{body}\n\n_Mostrando hasta {limit} filas._"
 
-
 async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = 10):
     """
     Envía Markdown usando ConnectorClient directamente (evita problemas de token saliente):
@@ -100,7 +76,6 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
     - Construimos credenciales con scope '.default' y tenant si aplica.
     - Enviamos con conversations.reply_to_activity (mismo hilo).
     """
-    # Datos del canal necesarios para responder
     su = getattr(context.activity, "service_url", None)
     conv = getattr(context.activity, "conversation", None)
     conv_id = conv.id if conv else None
@@ -162,9 +137,8 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
         except Exception as e2:
             print(f"[gw] ERROR send_activity (fallback tras ConnectorClient): {repr(e2)}")
 
-
 # -----------------------------------------------------------------------------
-# 5) Lógica principal de mensajes
+# 4) Lógica principal de mensajes
 # -----------------------------------------------------------------------------
 async def on_message(context: TurnContext):
     """
@@ -206,9 +180,8 @@ async def on_message(context: TurnContext):
     title = f"**{intent}** — {summary}"
     await _reply_md(context, title, cols, rows, limit=10)
 
-
 # -----------------------------------------------------------------------------
-# 6) Rutas HTTP (health/diag + BF)
+# 5) Rutas HTTP (health/diag + BF)
 # -----------------------------------------------------------------------------
 @app.get("/")
 def root():
@@ -306,7 +279,7 @@ async def api_messages(req: Request):
             # conversationUpdate, invoke, etc. (si los quieres manejar luego)
             pass
 
-    # Validación y pipeline del SDK
+    # Validación y pipeline del SDK (sin parches)
     await adapter.process_activity(activity, auth_header, aux)
 
     return Response(status_code=200, content=json.dumps({"ok": True}), media_type="application/json")
