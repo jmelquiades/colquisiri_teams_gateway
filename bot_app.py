@@ -69,41 +69,77 @@ def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10
     body   = "\n".join("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |" for r in rows[:limit])
     return f"{header}\n{sep}\n{body}\n\n_Mostrando hasta {limit} filas._"
 
+
 async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = 10):
     """
-    Envía Markdown usando ConnectorClient directamente (evita problemas de token saliente):
-    - Confiamos el serviceUrl (recomendación MS).
+    Envía Markdown usando ConnectorClient directamente:
+    - Confiamos el serviceUrl.
     - Construimos credenciales con scope '.default' y tenant si aplica.
-    - Enviamos con conversations.reply_to_activity (mismo hilo).
+    - Creamos un Activity COMPLETO (from/recipient) y respondemos en el mismo hilo.
     """
     su = getattr(context.activity, "service_url", None)
     conv = getattr(context.activity, "conversation", None)
     conv_id = conv.id if conv else None
     reply_to_id = getattr(context.activity, "id", None)
 
-    # Confiar el serviceUrl
+    # Confiar el serviceUrl (recomendado por Microsoft)
     if su:
         try:
             MicrosoftAppCredentials.trust_service_url(su)
         except Exception as e:
             print(f"[gw] WARN trust_service_url: {e}")
 
-    # Markdown final
     md = f"{title}\n\n{_markdown_table(cols, rows, limit)}"
 
-    # Modo silencioso: imprime y no envía (útil para diagnósticos)
     if REPLY_MODE.lower() == "silent":
         print("[gw] SILENT MODE — markdown construido (no enviado):")
         print(md[:2000])
         return
 
-    # Si no tuviéramos los IDs del hilo, hacemos fallback informativo
     if not (su and conv_id and reply_to_id):
         try:
             await context.send_activity("⚠️ No se encontró información suficiente del canal para responder.")
         except Exception as e:
             print(f"[gw] ERROR send_activity (fallback): {repr(e)}")
         return
+
+    # Credenciales explícitas (scope correcto + tenant si aplica)
+    creds = MicrosoftAppCredentials(
+        app_id=APP_ID,
+        password=APP_PWD,
+        channel_auth_tenant=TENANT if (APP_TYPE == "SingleTenant" and TENANT) else None,
+        oauth_scope="https://api.botframework.com/.default",
+    )
+
+    connector = ConnectorClient(credentials=creds, base_url=su)
+
+    # ⚠️ Construimos un Activity COMPLETO con from/recipient
+    bot_acc = context.activity.recipient or ChannelAccount(id=APP_ID)  # el bot
+    user_acc = context.activity.from_property or ChannelAccount(id="user")  # el usuario
+
+    reply_activity = Activity(
+        type=ActivityTypes.message,
+        text=md,
+        text_format="markdown",
+        from_property=ChannelAccount(id=bot_acc.id, name=getattr(bot_acc, "name", None)),
+        recipient=ChannelAccount(id=user_acc.id, name=getattr(user_acc, "name", None)),
+        locale=getattr(context.activity, "locale", None),
+    )
+
+    try:
+        await connector.conversations.reply_to_activity(
+            conversation_id=conv_id,
+            activity_id=reply_to_id,
+            activity=reply_activity,
+        )
+    except Exception as e:
+        print(f"[gw] ERROR ConnectorClient.reply_to_activity: {repr(e)}")
+        # Último intento con send_activity, por si el cliente directo fallara
+        try:
+            await context.send_activity("⚠️ No pude enviar la respuesta por el canal. Intenta de nuevo.")
+        except Exception as e2:
+            print(f"[gw] ERROR send_activity (fallback tras ConnectorClient): {repr(e2)}")
+
 
     # Credenciales explícitas (scope correcto + tenant si aplica)
     creds = MicrosoftAppCredentials(
