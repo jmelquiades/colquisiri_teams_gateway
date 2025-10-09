@@ -16,6 +16,7 @@ import httpx
 import msal
 from fastapi import FastAPI, Request, Response
 
+from bot_backend.nlu_rules import detect_intent  # nuevo import
 from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, TurnContext
 from botbuilder.schema import Activity, ActivityTypes, ChannelAccount
 from botframework.connector import ConnectorClient
@@ -289,3 +290,15 @@ async def api_messages(req: Request):
 
     await adapter.process_activity(activity, auth_header, aux)
     return Response(status_code=200, content=json.dumps({"ok": True}), media_type="application/json")
+
+
+intent = detect_intent(text)
+if intent == "help":
+    await context.send_activity(
+        "**Puedo ayudarte con:**\n"
+        "• `facturas que vencen este mes`\n"
+        "• `facturas vencidas hoy`\n"
+        "• `top clientes por saldo vencido`\n"
+        "\n_Escribe un comando o una frase similar._"
+    )
+    return
