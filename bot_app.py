@@ -6,6 +6,9 @@
 # - Responde con ConnectorClient.send_to_conversation (sin await)
 # - Activity JSON con 'from' y 'recipient' explícitos
 # - Diags: /health, /diag/env, /diag/msal, /diag/sdk-token
+# - INTENT_MODE:
+#     * "gateway" -> el gateway detecta intención básica (compat con backend actual)
+#     * "backend" -> el gateway pasa solo utterance y el backend hace NLU
 # -----------------------------------------------------------------------------
 
 import os
@@ -36,10 +39,13 @@ APP_PWD = os.getenv("MICROSOFT_APP_PASSWORD") or os.getenv("MicrosoftAppPassword
 APP_TYPE = os.getenv("MicrosoftAppType", "MultiTenant")  # "SingleTenant" | "MultiTenant"
 TENANT   = os.getenv("MicrosoftAppTenantId")
 
-BACKEND_URL   = os.getenv("BACKEND_URL", "https://admin-assistant-npsd.onrender.com")
-REPLY_MODE    = os.getenv("REPLY_MODE", "active")  # "active" | "silent"
+BACKEND_URL    = os.getenv("BACKEND_URL", "https://admin-assistant-npsd.onrender.com")
+REPLY_MODE     = os.getenv("REPLY_MODE", "active")   # "active" | "silent"
 DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "es-PE")
 PAGE_LIMIT     = int(os.getenv("PAGE_LIMIT", "10"))
+
+# ⭐ Nuevo: dónde se resuelve la intención
+INTENT_MODE    = os.getenv("INTENT_MODE", "gateway") # "gateway" | "backend"
 
 # -----------------------------------------------------------------------------
 # 2) FastAPI + Adapter (SDK 4.14.3)
@@ -56,6 +62,7 @@ adapter = BotFrameworkAdapter(adapter_settings)
 # 3) Util: tabla markdown
 # -----------------------------------------------------------------------------
 def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = PAGE_LIMIT) -> str:
+    """Construye una tabla Markdown amigable para Teams/Web Chat."""
     if not rows:
         return "_(sin resultados)_"
     header = "| " + " | ".join(cols) + " |"
@@ -64,9 +71,10 @@ def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = PA
     return f"{header}\n{sep}\n{body}\n\n_Mostrando hasta {limit} filas._"
 
 # -----------------------------------------------------------------------------
-# 4) Detección de intent (simple; reemplázalo por tu NLU cuando gustes)
+# 4) Detección de intent (simple; útil como compat mientras migras al backend)
 # -----------------------------------------------------------------------------
 def detect_intent(text: str) -> str:
+    """Reglas mínimas para mantener compatibilidad con tu backend actual."""
     t = (text or "").lower()
     if t.strip() in ("ayuda", "help", "?"):
         return "help"
@@ -77,8 +85,7 @@ def detect_intent(text: str) -> str:
     if (("vencen" in t or "vencimiento" in t or "por vencer" in t or "pendiente" in t or "pendientes" in t)
         and ("mes" in t or "mes actual" in t or "este mes" in t)):
         return "invoices_due_this_month"
-    # fallback
-    return "help"
+    return "invoices_due_this_month"  # fallback útil
 
 def _help_text() -> str:
     return (
@@ -173,17 +180,31 @@ async def _reply_markdown(context: TurnContext, title: str, cols: List[str], row
 # 6) Handler principal de mensajes
 # -----------------------------------------------------------------------------
 async def on_message(context: TurnContext):
+    """
+    1) Lee el texto del usuario.
+    2) Decide si la intención la resuelve el gateway o el backend (INTENT_MODE).
+    3) Invoca /n2sql/run del backend.
+    4) Renderiza Markdown al canal.
+    """
     text = (context.activity.text or "").strip()
     user: ChannelAccount = context.activity.from_property or ChannelAccount(id="u1", name="Usuario")
 
-    intent = detect_intent(text)
-    if intent == "help":
+    # Ayuda rápida desde el gateway
+    if text.lower().strip() in ("ayuda", "help", "?"):
         await context.send_activity(_help_text())
         return
 
+    # Según INTENT_MODE armamos el payload
+    if INTENT_MODE.lower() == "backend":
+        # Delega NLU al backend
+        intent_to_send = ""  # backend lo detecta
+    else:
+        # Compatibilidad con backend actual
+        intent_to_send = detect_intent(text)
+
     payload = {
         "user": {"id": user.id or "u1", "name": user.name or "Usuario"},
-        "intent": intent,
+        "intent": intent_to_send,
         "utterance": text,
     }
 
@@ -203,7 +224,11 @@ async def on_message(context: TurnContext):
     cols: List[str] = data.get("columns", []) or []
     rows: List[Dict[str, Any]] = data.get("rows", []) or []
     summary: str = data.get("summary", "") or f"{len(rows)} filas."
-    title = f"**{intent}** — {summary}"
+
+    # Título inteligente: preferimos lo que diga el backend si lo envía
+    backend_intent = data.get("intent") or data.get("detected_intent")
+    title_intent = backend_intent or (intent_to_send if intent_to_send else "Resultados")
+    title = f"**{title_intent}** — {summary}"
 
     await _reply_markdown(context, title, cols, rows, limit=PAGE_LIMIT)
 
@@ -229,10 +254,12 @@ def diag_env():
         "secret_len": len(apw),
         "app_type": APP_TYPE,
         "tenant_set": bool(TENANT),
+        "intent_mode": INTENT_MODE,
     }
 
 @app.get("/diag/msal")
 def diag_msal():
+    """Comprueba que AAD emite tokens para el scope del Bot Framework."""
     if not APP_ID or not APP_PWD:
         return {"ok": False, "error": "Faltan AppId/Secret"}
     authority = (
@@ -248,6 +275,7 @@ def diag_msal():
 
 @app.get("/diag/sdk-token")
 def diag_sdk_token():
+    """Pide un token saliente usando MicrosoftAppCredentials (lo que usa ConnectorClient)."""
     try:
         creds = MicrosoftAppCredentials(
             app_id=APP_ID,
@@ -269,6 +297,11 @@ def options_messages():
 
 @app.post("/api/messages")
 async def api_messages(req: Request):
+    """
+    Entrada principal del Bot Framework:
+    - El header Authorization contiene el token JWT que valida el Adapter.
+    - Se deserializa el Activity y se procesa con el pipeline del SDK.
+    """
     body = await req.json()
     activity = Activity().deserialize(body)
 
