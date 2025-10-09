@@ -2,8 +2,8 @@
 # -----------------------------------------------------------------------------
 # Gateway para Microsoft Bot Framework (Web Chat/Teams)
 # - Recibe /api/messages (Adapter SDK 4.14.3 valida el token entrante)
-# - Llama a tu backend /n2sql/run
-# - Responde usando ConnectorClient.send_to_conversation (sin await)
+# - Llama al backend /n2sql/run
+# - Responde con ConnectorClient.send_to_conversation (sin await)
 # - Activity JSON con 'from' y 'recipient' explícitos
 # - Diags: /health, /diag/env, /diag/msal, /diag/sdk-token
 # -----------------------------------------------------------------------------
@@ -38,6 +38,8 @@ TENANT   = os.getenv("MicrosoftAppTenantId")
 
 BACKEND_URL = os.getenv("BACKEND_URL", "https://admin-assistant-npsd.onrender.com")
 REPLY_MODE  = os.getenv("REPLY_MODE", "active")  # "active" | "silent"
+DEFAULT_LOCALE = os.getenv("DEFAULT_LOCALE", "es-PE")
+PAGE_LIMIT = int(os.getenv("PAGE_LIMIT", "10"))
 
 # -----------------------------------------------------------------------------
 # 2) FastAPI + Adapter (SDK 4.14.3)
@@ -51,9 +53,9 @@ adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PWD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
 # -----------------------------------------------------------------------------
-# 3) Presentación: tabla markdown
+# 3) Util: tabla markdown
 # -----------------------------------------------------------------------------
-def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10) -> str:
+def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = PAGE_LIMIT) -> str:
     if not rows:
         return "_(sin resultados)_"
     header = "| " + " | ".join(cols) + " |"
@@ -62,14 +64,43 @@ def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10
     return f"{header}\n{sep}\n{body}\n\n_Mostrando hasta {limit} filas._"
 
 # -----------------------------------------------------------------------------
-# 4) Respuesta al canal con ConnectorClient (¡sin reply_to_id!)
+# 4) Detección de intent (simple y efectiva para demo)
 # -----------------------------------------------------------------------------
-async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = 10):
+def _detect_intent(text: str) -> str:
+    t = (text or "").lower()
+    # ayuda
+    if t.strip() in ("ayuda", "help", "?"):
+        return "help"
+    # intents por palabras clave
+    if "vencid" in t and "hoy" in t:
+        return "overdue_today"
+    if ("top" in t and "client" in t) or ("top" in t and "cliente" in t) or ("saldo" in t and "vencido" in t):
+        return "top_clients_overdue"
+    if ("vencen" in t or "vencimiento" in t or "por vencer" in t) and ("mes" in t or "mes actual" in t):
+        return "invoices_due_this_month"
+    # fallback: si menciona "vencen" sin "mes", mejor mostrar ayuda
+    if "vencen" in t or "facturas" in t:
+        return "help"
+    return "help"
+
+def _help_text() -> str:
+    return (
+        "**Puedo ayudarte con:**\n"
+        "• `facturas que vencen este mes`\n"
+        "• `facturas vencidas hoy`\n"
+        "• `top clientes por saldo vencido`\n"
+        "\n_Escribe un comando o una frase similar._"
+    )
+
+# -----------------------------------------------------------------------------
+# 5) Respuesta al canal con ConnectorClient (¡sin reply_to_id!)
+# -----------------------------------------------------------------------------
+async def _reply_markdown(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = PAGE_LIMIT):
     """
     Envía Markdown con ConnectorClient (SDK 4.14.3):
-    - Usamos send_to_conversation (llamada SINCRÓNICA)
-    - Activity JSON con claves exactas: 'from', 'recipient', 'conversation', 'channelId', 'serviceUrl'
-    - Credenciales con scope .default y tenant si aplica
+    - Usamos send_to_conversation (llamada SINCRÓNICA).
+    - Activity JSON con claves exactas: 'from', 'recipient', 'conversation', 'channelId', 'serviceUrl'.
+    - Credenciales con scope .default y tenant si aplica.
     """
     act_in = context.activity
     su           = getattr(act_in, "service_url", None)
@@ -78,7 +109,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
     conv_id      = conv_in.id if conv_in else None
     user_acc     = getattr(act_in, "from_property", None)  # usuario que escribió
     bot_acc      = getattr(act_in, "recipient", None)      # el bot (este gateway)
-    locale       = getattr(act_in, "locale", None)
+    locale       = getattr(act_in, "locale", None) or DEFAULT_LOCALE
 
     # Confiar serviceUrl (recomendado por Microsoft)
     if su:
@@ -94,7 +125,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
         print(md[:2000])
         return
 
-    # Validaciones mínimas
+    # Validaciones mínimas para responder
     if not (su and channel_id and conv_id and user_acc and bot_acc):
         try:
             await context.send_activity("⚠️ No se encontró información suficiente del canal para responder.")
@@ -127,7 +158,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
         "recipient": {"id": usr_id, "name": usr_name, "role": "user"},
         "textFormat": "markdown",
         "text": md,
-        "locale": locale or "es-PE",
+        "locale": locale,
     }
 
     try:
@@ -135,21 +166,23 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
         connector.conversations.send_to_conversation(conversation_id=conv_id, activity=reply_activity)
     except Exception as e:
         print(f"[gw] ERROR ConnectorClient.send_to_conversation: {repr(e)}")
-        # Último intento con send_activity (puede fallar por token saliente)
+        # Último intento con send_activity (puede fallar por credenciales salientes)
         try:
             await context.send_activity("⚠️ No pude enviar la respuesta por el canal. Intenta de nuevo.")
         except Exception as e2:
             print(f"[gw] ERROR send_activity (fallback tras ConnectorClient): {repr(e2)}")
 
 # -----------------------------------------------------------------------------
-# 5) Handler principal de mensajes
+# 6) Handler principal de mensajes
 # -----------------------------------------------------------------------------
 async def on_message(context: TurnContext):
     text = (context.activity.text or "").strip()
     user: ChannelAccount = context.activity.from_property or ChannelAccount(id="u1", name="Usuario")
 
-    # Enrute DEMO (ajusta a tu router real cuando quieras)
-    intent = "invoices_due_this_month" if ("vencen" in text.lower() and "mes" in text.lower()) else "top_clients_overdue"
+    intent = _detect_intent(text)
+    if intent == "help":
+        await context.send_activity(_help_text())
+        return
 
     payload = {
         "user": {"id": user.id or "u1", "name": user.name or "Usuario"},
@@ -175,10 +208,10 @@ async def on_message(context: TurnContext):
     summary: str = data.get("summary", "") or f"{len(rows)} filas."
     title = f"**{intent}** — {summary}"
 
-    await _reply_md(context, title, cols, rows, limit=10)
+    await _reply_markdown(context, title, cols, rows, limit=PAGE_LIMIT)
 
 # -----------------------------------------------------------------------------
-# 6) Rutas HTTP (health/diag + BF)
+# 7) Rutas HTTP (health/diag + BF)
 # -----------------------------------------------------------------------------
 @app.get("/")
 def root():
@@ -234,6 +267,7 @@ def diag_sdk_token():
 
 @app.options("/api/messages")
 def options_messages():
+    # Útil para CORS/preflight de pruebas locales
     return Response(status_code=200)
 
 @app.post("/api/messages")
@@ -241,6 +275,7 @@ async def api_messages(req: Request):
     body = await req.json()
     activity = Activity().deserialize(body)
 
+    # token de Bot Service (autenticación entrante)
     auth_header = req.headers.get("authorization") or req.headers.get("Authorization") or ""
     client = req.client.host if req.client else "unknown"
     print(f"[gw] has_auth={bool(auth_header)} from={client}")
@@ -249,6 +284,7 @@ async def api_messages(req: Request):
         if activity.type == ActivityTypes.message:
             await on_message(turn_context)
         else:
+            # otros tipos (conversationUpdate, invoke, etc.) se pueden manejar si hace falta
             pass
 
     await adapter.process_activity(activity, auth_header, aux)
