@@ -72,17 +72,25 @@ def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10
 
 async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = 10):
     """
-    Envía Markdown usando ConnectorClient directamente:
-    - Confiamos el serviceUrl.
-    - Construimos credenciales con scope '.default' y tenant si aplica.
-    - Creamos un Activity COMPLETO (from/recipient) y respondemos en el mismo hilo.
+    Envía Markdown con ConnectorClient (SDK 4.14.3):
+    - NO usar 'await' al llamar reply_to_activity (es sincrónico).
+    - Activity completo: from/recipient/conversation/channel_id/service_url.
     """
-    su = getattr(context.activity, "service_url", None)
-    conv = getattr(context.activity, "conversation", None)
-    conv_id = conv.id if conv else None
-    reply_to_id = getattr(context.activity, "id", None)
+    from botbuilder.schema import Activity, ActivityTypes, ChannelAccount, ConversationAccount
+    from botframework.connector import ConnectorClient
+    from botframework.connector.auth import MicrosoftAppCredentials
 
-    # Confiar el serviceUrl (recomendado por Microsoft)
+    # Fuente de verdad: el activity entrante
+    act_in = context.activity
+    su           = getattr(act_in, "service_url", None)
+    channel_id   = getattr(act_in, "channel_id", None)
+    conv_in      = getattr(act_in, "conversation", None)
+    conv_id      = conv_in.id if conv_in else None
+    reply_to_id  = getattr(act_in, "id", None)
+    user_acc     = getattr(act_in, "from_property", None)      # usuario
+    bot_acc      = getattr(act_in, "recipient", None)          # bot (este gateway)
+
+    # Confiar el serviceUrl (recomendación MS)
     if su:
         try:
             MicrosoftAppCredentials.trust_service_url(su)
@@ -96,14 +104,15 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
         print(md[:2000])
         return
 
-    if not (su and conv_id and reply_to_id):
+    # Validaciones mínimas para poder responder en el mismo hilo
+    if not (su and channel_id and conv_id and reply_to_id and user_acc and bot_acc):
         try:
             await context.send_activity("⚠️ No se encontró información suficiente del canal para responder.")
         except Exception as e:
             print(f"[gw] ERROR send_activity (fallback): {repr(e)}")
         return
 
-    # Credenciales explícitas (scope correcto + tenant si aplica)
+    # Credenciales con scope correcto y tenant si aplica
     creds = MicrosoftAppCredentials(
         app_id=APP_ID,
         password=APP_PWD,
@@ -113,21 +122,23 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
 
     connector = ConnectorClient(credentials=creds, base_url=su)
 
-    # ⚠️ Construimos un Activity COMPLETO con from/recipient
-    bot_acc = context.activity.recipient or ChannelAccount(id=APP_ID)  # el bot
-    user_acc = context.activity.from_property or ChannelAccount(id="user")  # el usuario
-
+    # Construimos un Activity COMPLETO. Ojo: en Python se usa 'from_property'.
     reply_activity = Activity(
         type=ActivityTypes.message,
-        text=md,
+        channel_id=channel_id,
+        service_url=su,
+        conversation=ConversationAccount(id=conv_id),
+        from_property=ChannelAccount(id=bot_acc.id, name=getattr(bot_acc, "name", None)),       # el BOT
+        recipient=ChannelAccount(id=user_acc.id, name=getattr(user_acc, "name", None)),         # el USUARIO
         text_format="markdown",
-        from_property=ChannelAccount(id=bot_acc.id, name=getattr(bot_acc, "name", None)),
-        recipient=ChannelAccount(id=user_acc.id, name=getattr(user_acc, "name", None)),
-        locale=getattr(context.activity, "locale", None),
+        text=md,
+        locale=getattr(act_in, "locale", None),
+        relates_to=None,  # opcional; no es necesario para reply_to_activity
     )
 
     try:
-        await connector.conversations.reply_to_activity(
+        # ⚠️ IMPORTANTE: SDK 4.14.3 -> método SINCRÓNICO (NO 'await')
+        connector.conversations.reply_to_activity(
             conversation_id=conv_id,
             activity_id=reply_to_id,
             activity=reply_activity,
