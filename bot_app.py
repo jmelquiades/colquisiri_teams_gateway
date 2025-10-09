@@ -1,10 +1,11 @@
 # bot_app.py
 # -----------------------------------------------------------------------------
 # Gateway para Microsoft Bot Framework (Web Chat/Teams)
-# - Recibe /api/messages, valida Authorization entrante con el Adapter (SDK 4.14.3)
+# - Recibe /api/messages (Adapter SDK 4.14.3 valida el token entrante)
 # - Llama a tu backend /n2sql/run
-# - Responde en el canal usando ConnectorClient (token saliente con scope .default)
-# - Endpoints: /health, /diag/env, /diag/msal, /diag/sdk-token
+# - Responde usando ConnectorClient.send_to_conversation (sin await)
+# - Activity JSON con 'from' y 'recipient' explícitos
+# - Diags: /health, /diag/env, /diag/msal, /diag/sdk-token
 # -----------------------------------------------------------------------------
 
 import os
@@ -21,31 +22,25 @@ from botframework.connector import ConnectorClient
 from botframework.connector.auth import MicrosoftAppCredentials
 
 # -----------------------------------------------------------------------------
-# 0) Contexto de nube: fuerza "Public" (evita rutas Gov/DoD que rompen el token)
+# 0) Forzar nube pública (evita endpoints Gov/DoD)
 # -----------------------------------------------------------------------------
 os.environ["ChannelService"] = "Public"
 os.environ["CHANNEL_SERVICE"] = "Public"
 
 # -----------------------------------------------------------------------------
-# 1) Configuración (variables de entorno)
+# 1) Configuración (ENV)
 # -----------------------------------------------------------------------------
 APP_ID  = os.getenv("MICROSOFT_APP_ID") or os.getenv("MicrosoftAppId")
 APP_PWD = os.getenv("MICROSOFT_APP_PASSWORD") or os.getenv("MicrosoftAppPassword")
 
-# Tipo de app y Tenant:
-# - SingleTenant -> requiere MicrosoftAppTenantId
-# - MultiTenant  -> sin TenantId
 APP_TYPE = os.getenv("MicrosoftAppType", "MultiTenant")  # "SingleTenant" | "MultiTenant"
 TENANT   = os.getenv("MicrosoftAppTenantId")
 
-# Backend (tu servicio N2SQL en Render)
 BACKEND_URL = os.getenv("BACKEND_URL", "https://admin-assistant-npsd.onrender.com")
-
-# Modo diagnóstico: "silent" arma el Markdown pero no envía (útil para aislar)
 REPLY_MODE  = os.getenv("REPLY_MODE", "active")  # "active" | "silent"
 
 # -----------------------------------------------------------------------------
-# 2) FastAPI + Adapter (SDK 4.14.3 sin kwargs extra)
+# 2) FastAPI + Adapter (SDK 4.14.3)
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Teams Gateway")
 
@@ -56,12 +51,9 @@ adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PWD)
 adapter = BotFrameworkAdapter(adapter_settings)
 
 # -----------------------------------------------------------------------------
-# 3) Helpers de presentación
+# 3) Presentación: tabla markdown
 # -----------------------------------------------------------------------------
 def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10) -> str:
-    """
-    Construye tabla Markdown con hasta 'limit' filas.
-    """
     if not rows:
         return "_(sin resultados)_"
     header = "| " + " | ".join(cols) + " |"
@@ -69,25 +61,23 @@ def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10
     body   = "\n".join("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |" for r in rows[:limit])
     return f"{header}\n{sep}\n{body}\n\n_Mostrando hasta {limit} filas._"
 
-
-
-
+# -----------------------------------------------------------------------------
+# 4) Respuesta al canal con ConnectorClient (¡sin reply_to_id!)
+# -----------------------------------------------------------------------------
 async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = 10):
     """
-    Envía Markdown con ConnectorClient (SDK 4.14.3) usando un dict JSON:
-    - Claves JSON exactas: 'from', 'recipient', 'conversation', 'channelId', 'serviceUrl'
-    - Usa send_to_conversation (llamada SINCRÓNICA, ¡sin await!)
+    Envía Markdown con ConnectorClient (SDK 4.14.3):
+    - Usamos send_to_conversation (llamada SINCRÓNICA)
+    - Activity JSON con claves exactas: 'from', 'recipient', 'conversation', 'channelId', 'serviceUrl'
+    - Credenciales con scope .default y tenant si aplica
     """
-    from botframework.connector import ConnectorClient
-    from botframework.connector.auth import MicrosoftAppCredentials
-
     act_in = context.activity
     su           = getattr(act_in, "service_url", None)
     channel_id   = getattr(act_in, "channel_id", None)
     conv_in      = getattr(act_in, "conversation", None)
     conv_id      = conv_in.id if conv_in else None
-    user_acc     = getattr(act_in, "from_property", None)      # usuario
-    bot_acc      = getattr(act_in, "recipient", None)          # bot
+    user_acc     = getattr(act_in, "from_property", None)  # usuario que escribió
+    bot_acc      = getattr(act_in, "recipient", None)      # el bot (este gateway)
     locale       = getattr(act_in, "locale", None)
 
     # Confiar serviceUrl (recomendado por Microsoft)
@@ -104,7 +94,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
         print(md[:2000])
         return
 
-    # Validaciones mínimas para responder
+    # Validaciones mínimas
     if not (su and channel_id and conv_id and user_acc and bot_acc):
         try:
             await context.send_activity("⚠️ No se encontró información suficiente del canal para responder.")
@@ -112,7 +102,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
             print(f"[gw] ERROR send_activity (fallback): {repr(e)}")
         return
 
-    # Identidades (id/role)
+    # Identidades del Activity
     bot_id   = getattr(bot_acc, "id", None) or APP_ID
     bot_name = getattr(bot_acc, "name", None) or "Bot"
     usr_id   = getattr(user_acc, "id", None) or "user"
@@ -127,7 +117,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
     )
     connector = ConnectorClient(credentials=creds, base_url=su)
 
-    # Activity JSON – nota: CLAVE 'from' (no from_property)
+    # Activity JSON — OJO: clave 'from' literal
     reply_activity = {
         "type": "message",
         "channelId": channel_id,
@@ -141,75 +131,24 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
     }
 
     try:
-        # SDK 4.14.3: llamada SINCRÓNICA (NO usar 'await')
+        # Llamada SINCRÓNICA en 4.14.3 (no usar await)
         connector.conversations.send_to_conversation(conversation_id=conv_id, activity=reply_activity)
     except Exception as e:
         print(f"[gw] ERROR ConnectorClient.send_to_conversation: {repr(e)}")
-        # Último intento con send_activity (puede fallar por el token saliente)
-        try:
-            await context.send_activity("⚠️ No pude enviar la respuesta por el canal. Intenta de nuevo.")
-        except Exception as e2:
-            print(f"[gw] ERROR send_activity (fallback tras ConnectorClient): {repr(e2)}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-    # Credenciales explícitas (scope correcto + tenant si aplica)
-    creds = MicrosoftAppCredentials(
-        app_id=APP_ID,
-        password=APP_PWD,
-        channel_auth_tenant=TENANT if (APP_TYPE == "SingleTenant" and TENANT) else None,
-        oauth_scope="https://api.botframework.com/.default",
-    )
-
-    # Cliente apuntando al serviceUrl del activity
-    connector = ConnectorClient(credentials=creds, base_url=su)
-
-    # Activity de respuesta en Markdown
-    reply_activity = {
-        "type": "message",
-        "textFormat": "markdown",
-        "text": md,
-    }
-
-    try:
-        await connector.conversations.reply_to_activity(
-            conversation_id=conv_id,
-            activity_id=reply_to_id,
-            activity=reply_activity,
-        )
-    except Exception as e:
-        # Último intento con send_activity, por si el cliente directo fallara
-        print(f"[gw] ERROR ConnectorClient.reply_to_activity: {repr(e)}")
+        # Último intento con send_activity (puede fallar por token saliente)
         try:
             await context.send_activity("⚠️ No pude enviar la respuesta por el canal. Intenta de nuevo.")
         except Exception as e2:
             print(f"[gw] ERROR send_activity (fallback tras ConnectorClient): {repr(e2)}")
 
 # -----------------------------------------------------------------------------
-# 4) Lógica principal de mensajes
+# 5) Handler principal de mensajes
 # -----------------------------------------------------------------------------
 async def on_message(context: TurnContext):
-    """
-    Flujo:
-    - Lee texto y usuario
-    - Determina intent (demo)
-    - Llama backend /n2sql/run
-    - Responde con Markdown
-    """
     text = (context.activity.text or "").strip()
     user: ChannelAccount = context.activity.from_property or ChannelAccount(id="u1", name="Usuario")
 
-    # DEMO de intent (ajústalo con tu router real cuando quieras)
+    # Enrute DEMO (ajusta a tu router real cuando quieras)
     intent = "invoices_due_this_month" if ("vencen" in text.lower() and "mes" in text.lower()) else "top_clients_overdue"
 
     payload = {
@@ -218,7 +157,7 @@ async def on_message(context: TurnContext):
         "utterance": text,
     }
 
-    # Llamada al backend
+    # Llamada al backend N2SQL
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{BACKEND_URL}/n2sql/run", json=payload)
@@ -234,28 +173,23 @@ async def on_message(context: TurnContext):
     cols: List[str] = data.get("columns", []) or []
     rows: List[Dict[str, Any]] = data.get("rows", []) or []
     summary: str = data.get("summary", "") or f"{len(rows)} filas."
-
     title = f"**{intent}** — {summary}"
+
     await _reply_md(context, title, cols, rows, limit=10)
 
 # -----------------------------------------------------------------------------
-# 5) Rutas HTTP (health/diag + BF)
+# 6) Rutas HTTP (health/diag + BF)
 # -----------------------------------------------------------------------------
 @app.get("/")
 def root():
-    """Ping básico para Render."""
     return {"ok": True, "service": "teams-gateway"}
 
 @app.get("/health")
 def health():
-    """Health check simple."""
     return {"ok": True}
 
 @app.get("/diag/env")
 def diag_env():
-    """
-    Diagnóstico de variables (sin exponer secretos).
-    """
     aid = APP_ID or ""
     apw = APP_PWD or ""
     return {
@@ -269,9 +203,6 @@ def diag_env():
 
 @app.get("/diag/msal")
 def diag_msal():
-    """
-    Verifica token saliente usando MSAL directamente (fuera del SDK).
-    """
     if not APP_ID or not APP_PWD:
         return {"ok": False, "error": "Faltan AppId/Secret"}
     authority = (
@@ -279,11 +210,7 @@ def diag_msal():
         if (APP_TYPE == "SingleTenant" and TENANT)
         else "https://login.microsoftonline.com/organizations"
     )
-    cca = msal.ConfidentialClientApplication(
-        client_id=APP_ID,
-        client_credential=APP_PWD,
-        authority=authority,
-    )
+    cca = msal.ConfidentialClientApplication(client_id=APP_ID, client_credential=APP_PWD, authority=authority)
     res = cca.acquire_token_for_client(scopes=["https://api.botframework.com/.default"])
     if "access_token" in res:
         return {"ok": True, "token_type": res.get("token_type", "Bearer"), "expires_in": res.get("expires_in")}
@@ -291,9 +218,6 @@ def diag_msal():
 
 @app.get("/diag/sdk-token")
 def diag_sdk_token():
-    """
-    Verifica token saliente usando las mismas credenciales que usamos en ConnectorClient.
-    """
     try:
         creds = MicrosoftAppCredentials(
             app_id=APP_ID,
@@ -301,7 +225,7 @@ def diag_sdk_token():
             channel_auth_tenant=TENANT if (APP_TYPE == "SingleTenant" and TENANT) else None,
             oauth_scope="https://api.botframework.com/.default",
         )
-        tok = creds.get_access_token()  # "Bearer eyJ..." o similar
+        tok = creds.get_access_token()
         ok = bool(tok)
         prefix = tok[:12] if tok else ""
         return {"ok": ok, "prefix": prefix}
@@ -310,22 +234,13 @@ def diag_sdk_token():
 
 @app.options("/api/messages")
 def options_messages():
-    """Acepta OPTIONS en /api/messages (por si hay preflight)."""
     return Response(status_code=200)
 
 @app.post("/api/messages")
 async def api_messages(req: Request):
-    """
-    Endpoint principal del Bot Framework:
-    - Lee Activity
-    - Pasa Authorization al adapter (requisito para validar)
-    - Ejecuta on_message en mensajes de usuario
-    - Retorna 200 al Bot Service (la respuesta al usuario viaja por el canal)
-    """
     body = await req.json()
     activity = Activity().deserialize(body)
 
-    # Authorization real del Bot Service (case-insensitive)
     auth_header = req.headers.get("authorization") or req.headers.get("Authorization") or ""
     client = req.client.host if req.client else "unknown"
     print(f"[gw] has_auth={bool(auth_header)} from={client}")
@@ -334,10 +249,7 @@ async def api_messages(req: Request):
         if activity.type == ActivityTypes.message:
             await on_message(turn_context)
         else:
-            # conversationUpdate, invoke, etc. (si los quieres manejar luego)
             pass
 
-    # Validación y pipeline del SDK (sin parches)
     await adapter.process_activity(activity, auth_header, aux)
-
     return Response(status_code=200, content=json.dumps({"ok": True}), media_type="application/json")
