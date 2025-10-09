@@ -69,11 +69,14 @@ def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = 10
     body   = "\n".join("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |" for r in rows[:limit])
     return f"{header}\n{sep}\n{body}\n\n_Mostrando hasta {limit} filas._"
 
+
+
+
 async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = 10):
     """
     Envía Markdown con ConnectorClient (SDK 4.14.3) usando un dict JSON:
-    - Incluye claves JSON exactas: 'from', 'recipient', 'conversation', 'channelId', 'serviceUrl'.
-    - Usa send_to_conversation (sincrónico).
+    - Claves JSON exactas: 'from', 'recipient', 'conversation', 'channelId', 'serviceUrl'
+    - Usa send_to_conversation (llamada SINCRÓNICA, ¡sin await!)
     """
     from botframework.connector import ConnectorClient
     from botframework.connector.auth import MicrosoftAppCredentials
@@ -87,7 +90,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
     bot_acc      = getattr(act_in, "recipient", None)          # bot
     locale       = getattr(act_in, "locale", None)
 
-    # Confiar serviceUrl
+    # Confiar serviceUrl (recomendado por Microsoft)
     if su:
         try:
             MicrosoftAppCredentials.trust_service_url(su)
@@ -101,7 +104,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
         print(md[:2000])
         return
 
-    # Validaciones mínimas
+    # Validaciones mínimas para responder
     if not (su and channel_id and conv_id and user_acc and bot_acc):
         try:
             await context.send_activity("⚠️ No se encontró información suficiente del canal para responder.")
@@ -109,7 +112,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
             print(f"[gw] ERROR send_activity (fallback): {repr(e)}")
         return
 
-    # Identidades (aseguramos id y rol)
+    # Identidades (id/role)
     bot_id   = getattr(bot_acc, "id", None) or APP_ID
     bot_name = getattr(bot_acc, "name", None) or "Bot"
     usr_id   = getattr(user_acc, "id", None) or "user"
@@ -138,7 +141,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
     }
 
     try:
-        # SDK 4.14.3: llamadas sincrónicas → NO usar 'await'
+        # SDK 4.14.3: llamada SINCRÓNICA (NO usar 'await')
         connector.conversations.send_to_conversation(conversation_id=conv_id, activity=reply_activity)
     except Exception as e:
         print(f"[gw] ERROR ConnectorClient.send_to_conversation: {repr(e)}")
@@ -147,6 +150,7 @@ async def _reply_md(context: TurnContext, title: str, cols: List[str], rows: Lis
             await context.send_activity("⚠️ No pude enviar la respuesta por el canal. Intenta de nuevo.")
         except Exception as e2:
             print(f"[gw] ERROR send_activity (fallback tras ConnectorClient): {repr(e2)}")
+
 
 
 
