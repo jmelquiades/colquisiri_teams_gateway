@@ -3,7 +3,7 @@
 # Gateway para Microsoft Bot Framework (Web Chat/Teams)
 # - Recibe /api/messages (SDK 4.14.3 valida el token entrante).
 # - Detecta intención (con memoria de conversación para seguimientos).
-# - Extrae filtros simples (día del mes, próximas X semanas/días).
+# - Extrae filtros simples: día/mes/rangos + customer_query ("de COFACO").
 # - Llama al backend /n2sql/run con { user, intent, utterance, filters }.
 # - Responde al canal con ConnectorClient.send_to_conversation (SIN await).
 # - Diags: /health, /diag/env, /diag/msal, /diag/sdk-token, /diag/session
@@ -56,7 +56,6 @@ adapter = BotFrameworkAdapter(adapter_settings)
 
 # -----------------------------------------------------------------------------
 # 3) Memoria de sesión simple (en RAM, por conversación)
-#    - Guarda el último intent para permitir seguimientos ("y el 22?")
 # -----------------------------------------------------------------------------
 SESS: Dict[str, Dict[str, Any]] = {}  # { conv_id: {"last_intent": str | None} }
 
@@ -150,9 +149,45 @@ def _send_markdown_table(context: TurnContext, title: str, cols: List[str], rows
     _send_text(context, md)
 
 # -----------------------------------------------------------------------------
-# 5) Detección de intent + filtros
+# 5) Detección de intent + filtros (incluye customer_query)
 # -----------------------------------------------------------------------------
 DAY_RE = re.compile(r"(?:\b(?:y\s+)?(?:el\s+)?)?(?:día\s+)?(\d{1,2})\b", re.IGNORECASE)
+
+# Heurística para capturar empresa/cliente tras “de/para/del/cliente …” o entre comillas
+CUSTOMER_PATTERNS = [
+    r"'([^']{2,})'",                                  # 'COFACO'
+    r'"([^"]{2,})"',                                  # "COFACO"
+    r"“([^”]{2,})”",                                  # “COFACO”
+    r"(?:cliente\s+(?:llamad[oa]\s+|denominad[oa]\s+)?)\s*([A-Za-zÁÉÍÓÚÜÑ0-9][A-Za-zÁÉÍÓÚÜÑ0-9\.\-& ]{2,})",
+    r"(?:\bde\b|\bpara\b|\bdel\b)\s+([A-Za-zÁÉÍÓÚÜÑ0-9][A-Za-zÁÉÍÓÚÜÑ0-9\.\-& ]{2,})",
+]
+
+CUSTOMER_STOPWORDS = {
+    "mes","este","hoy","mañana","manana","semana","semanas","próximas","proximas",
+    "próximos","proximos","días","dias","día","dia","pendientes","pendiente","vencen",
+    "vencidas","vencida","vencimiento","todas","todo","entero"
+}
+
+def _extract_customer_query(text: str) -> Optional[str]:
+    t = text.strip()
+    for pat in CUSTOMER_PATTERNS:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if not m:
+            continue
+        candidate = (m.group(1) or "").strip(" ?!.;:,").strip()
+        # descartar capturas que solo sean stopwords o muy cortas
+        if len(candidate) < 2:
+            continue
+        low = candidate.lower()
+        if low in CUSTOMER_STOPWORDS:
+            continue
+        # evitar “de este mes”, “para mañana”, etc.
+        if any(sw in low.split() for sw in CUSTOMER_STOPWORDS):
+            # si contiene unidades corporativas, aún puede ser válido
+            if not any(tok in low for tok in ["s.a", "s.a.c", "sac", "inc", "ltda", "corp", "company", "industries"]):
+                continue
+        return candidate
+    return None
 
 def extract_filters(text: str) -> Dict[str, Any]:
     """
@@ -160,6 +195,7 @@ def extract_filters(text: str) -> Dict[str, Any]:
     - date_day: día del mes (1..31) si aparece "el 13", "día 22", "y el 7", etc.
     - range_next_days: si dice "próximas 2 semanas", "siguientes 10 días", etc.
     - whole_month: si dice "todo el mes".
+    - customer_query: si dice "de COFACO", "del cliente COFACO", comillas, etc.
     """
     t = (text or "").lower()
     filters: Dict[str, Any] = {}
@@ -188,7 +224,12 @@ def extract_filters(text: str) -> Dict[str, Any]:
             else:
                 filters["range_next_days"] = n
         else:
-            filters["range_next_days"] = 14  # default
+            filters["range_next_days"] = 14  # default 2 semanas
+
+    # customer_query (mantén el case original para el backend)
+    cq = _extract_customer_query(text)
+    if cq:
+        filters["customer_query"] = cq
 
     return filters
 
@@ -200,7 +241,8 @@ def _help_text() -> str:
         "• `facturas vencidas este mes`\n"
         "• `facturas vencidas hoy`\n"
         "• `facturas que vencen en las próximas 2 semanas`\n"
-        "_También entiendo: `las del 13`, `y de todo el mes?`, `próximas dos semanas`._\n"
+        "• `facturas pendientes de COFACO` _(este mes)_\n"
+        "_También entiendo: `las del 13`, `y de todo el mes?`, `próximas dos semanas`, `del cliente ACME`._\n"
     )
 
 def detect_intent(text: str, last_intent: Optional[str] = None) -> str:
@@ -208,6 +250,7 @@ def detect_intent(text: str, last_intent: Optional[str] = None) -> str:
     Detección de intención ligera + soporte de seguimiento:
     - Si ya hubo un intent y el nuevo texto solo agrega filtros (día, todo el mes, próximas semanas),
       reusa la última intención (o cambia a "invoices_due_next_days" si corresponde).
+    - Si el usuario dice “pendientes / por cobrar / cuentas por cobrar” sin mes, asumimos "invoices_due_this_month".
     """
     t = (text or "").lower().strip()
 
@@ -215,7 +258,7 @@ def detect_intent(text: str, last_intent: Optional[str] = None) -> str:
     has_day = DAY_RE.search(t) is not None
     whole_month = "todo el mes" in t or (("mes" in t) and ("todo" in t or "entero" in t))
     looks_range = ("próxim" in t or "siguient" in t or "proxim" in t) and any(
-        kw in t for kw in ["día", "dias", "día", "días", "semana", "semanas"]
+        kw in t for kw in ["día", "dias", "días", "semana", "semanas"]
     )
 
     if last_intent:
@@ -227,6 +270,10 @@ def detect_intent(text: str, last_intent: Optional[str] = None) -> str:
     # Small talk / ayuda
     if t in ("ayuda", "help", "?") or any(x in t for x in ["hola", "buenos días", "buenas", "qué hora", "que hora", "qué día", "que dia", "qué dia"]):
         return "help"
+
+    # Pendientes genérico (por defecto, mes actual)
+    if ("pendient" in t) or ("por cobrar" in t) or ("cuentas por cobrar" in t):
+        return "invoices_due_this_month"
 
     if whole_month:
         return last_intent or "invoices_due_this_month"
