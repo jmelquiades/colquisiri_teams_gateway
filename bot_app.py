@@ -12,7 +12,7 @@
 import os
 import re
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import httpx
 import msal
@@ -72,8 +72,70 @@ def _get_session(conv_id: Optional[str]) -> Dict[str, Any]:
     return SESS[conv_id]
 
 # -----------------------------------------------------------------------------
-# 4) Util: tabla markdown
+# 4) Helpers de envío: SIEMPRE ConnectorClient (no usar context.send_activity)
 # -----------------------------------------------------------------------------
+def _mk_credentials() -> MicrosoftAppCredentials:
+    """Credenciales salientes con scope moderno (.default)."""
+    return MicrosoftAppCredentials(
+        app_id=APP_ID,
+        password=APP_PWD,
+        channel_auth_tenant=TENANT if (APP_TYPE == "SingleTenant" and TENANT) else None,
+        oauth_scope="https://api.botframework.com/.default",
+    )
+
+def _extract_addrs(context: TurnContext) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[ChannelAccount], Optional[ChannelAccount], str]:
+    act = context.activity
+    su         = getattr(act, "service_url", None)
+    channel_id = getattr(act, "channel_id", None)
+    conv       = getattr(act, "conversation", None)
+    conv_id    = conv.id if conv else None
+    user_acc   = getattr(act, "from_property", None)
+    bot_acc    = getattr(act, "recipient", None)
+    locale     = getattr(act, "locale", None) or DEFAULT_LOCALE
+    return su, channel_id, conv_id, user_acc, bot_acc, locale
+
+def _send_text(context: TurnContext, text: str) -> None:
+    """Envía texto (markdown) usando ConnectorClient (sin await)."""
+    su, channel_id, conv_id, user_acc, bot_acc, locale = _extract_addrs(context)
+
+    if not (su and channel_id and conv_id and user_acc and bot_acc):
+        print("[gw] ERROR _send_text: faltan campos mínimos del activity para responder.")
+        return
+
+    try:
+        MicrosoftAppCredentials.trust_service_url(su)
+    except Exception as e:
+        print(f"[gw] WARN trust_service_url: {e}")
+
+    creds = _mk_credentials()
+    connector = ConnectorClient(credentials=creds, base_url=su)
+
+    bot_id   = getattr(bot_acc, "id", None) or APP_ID
+    bot_name = getattr(bot_acc, "name", None) or "Bot"
+    usr_id   = getattr(user_acc, "id", None) or "user"
+    usr_name = getattr(user_acc, "name", None) or "Usuario"
+
+    activity = {
+        "type": "message",
+        "channelId": channel_id,
+        "serviceUrl": su,
+        "conversation": {"id": conv_id},
+        "from": {"id": bot_id, "name": bot_name, "role": "bot"},
+        "recipient": {"id": usr_id, "name": usr_name, "role": "user"},
+        "textFormat": "markdown",
+        "text": text,
+        "locale": locale,
+    }
+
+    try:
+        if REPLY_MODE.lower() == "active":
+            connector.conversations.send_to_conversation(conversation_id=conv_id, activity=activity)
+        else:
+            print("[gw] SILENT MODE — no se envía al canal:")
+            print(text[:1200])
+    except Exception as e:
+        print(f"[gw] ERROR send_to_conversation (text): {repr(e)}")
+
 def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = PAGE_LIMIT) -> str:
     if not rows:
         return "_(sin resultados)_"
@@ -82,10 +144,15 @@ def _markdown_table(cols: List[str], rows: List[Dict[str, Any]], limit: int = PA
     body   = "\n".join("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |" for r in rows[:limit])
     return f"{header}\n{sep}\n{body}\n\n_Mostrando hasta {limit} filas._"
 
+def _send_markdown_table(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = PAGE_LIMIT) -> None:
+    """Envía una tabla en Markdown usando ConnectorClient (sin await)."""
+    md = f"{title}\n\n{_markdown_table(cols, rows, limit)}"
+    _send_text(context, md)
+
 # -----------------------------------------------------------------------------
 # 5) Detección de intent + filtros
 # -----------------------------------------------------------------------------
-DAY_RE = re.compile(r"(?:\b(?:y\s+)?(?:el\s+)?)?(?:día\s+)?(\d{1,2})\b")
+DAY_RE = re.compile(r"(?:\b(?:y\s+)?(?:el\s+)?)?(?:día\s+)?(\d{1,2})\b", re.IGNORECASE)
 
 def extract_filters(text: str) -> Dict[str, Any]:
     """
@@ -112,30 +179,28 @@ def extract_filters(text: str) -> Dict[str, Any]:
         filters["whole_month"] = True
 
     # próximas X semanas/días
-    if "próxim" in t or "siguient" in t:
-        # intenta capturar número (p.ej. "2 semanas", "10 dias")
-        m_num = re.search(r"(\d{1,2})\s+(?:semana|semanas|día|días|dias)", t)
+    if "próxim" in t or "siguient" in t or "proxim" in t:
+        m_num = re.search(r"(\d{1,2})\s+(?:semana|semanas|día|días|dia|dias)", t)
         if m_num:
             n = int(m_num.group(1))
-            if "semana" in t or "semanas" in t:
+            if "semana" in t:
                 filters["range_next_days"] = n * 7
             else:
                 filters["range_next_days"] = n
         else:
-            # por defecto, próximas 2 semanas
-            filters["range_next_days"] = 14
+            filters["range_next_days"] = 14  # default
 
     return filters
 
 def _help_text() -> str:
     return (
-        "Hola, soy Lucero. Hoy te ayudo con facturación.\n\n"
+        "Hola, soy **Lucero**. Hoy te ayudo con facturación.\n\n"
         "**Puedo ayudarte con:**\n"
         "• `facturas que vencen este mes`\n"
         "• `facturas vencidas este mes`\n"
         "• `facturas vencidas hoy`\n"
         "• `facturas que vencen en las próximas 2 semanas`\n"
-        "También puedo entender: `las del 13`, `y de todo el mes?`, `próximas dos semanas`.\n"
+        "_También entiendo: `las del 13`, `y de todo el mes?`, `próximas dos semanas`._\n"
     )
 
 def detect_intent(text: str, last_intent: Optional[str] = None) -> str:
@@ -149,7 +214,9 @@ def detect_intent(text: str, last_intent: Optional[str] = None) -> str:
     # Seguimientos basados en último intent
     has_day = DAY_RE.search(t) is not None
     whole_month = "todo el mes" in t or (("mes" in t) and ("todo" in t or "entero" in t))
-    looks_range = ("próxim" in t or "siguient" in t) and ("día" in t or "dias" in t or "semana" in t or "semanas" in t)
+    looks_range = ("próxim" in t or "siguient" in t or "proxim" in t) and any(
+        kw in t for kw in ["día", "dias", "día", "días", "semana", "semanas"]
+    )
 
     if last_intent:
         if has_day or whole_month:
@@ -158,27 +225,22 @@ def detect_intent(text: str, last_intent: Optional[str] = None) -> str:
             return "invoices_due_next_days"
 
     # Small talk / ayuda
-    if t in ("ayuda", "help", "?") or any(x in t for x in ["hola", "buenos días", "buenas", "qué hora", "que hora", "qué día", "que día", "que dia", "qué dia"]):
+    if t in ("ayuda", "help", "?") or any(x in t for x in ["hola", "buenos días", "buenas", "qué hora", "que hora", "qué día", "que dia", "qué dia"]):
         return "help"
 
-    # “mes completo” explícito
     if whole_month:
         return last_intent or "invoices_due_this_month"
 
-    # vencidas del mes
     if ("vencid" in t or "atrasad" in t) and ("mes" in t or "este mes" in t):
         return "overdue_this_month"
 
-    # próximas X días / semanas
     if looks_range:
         return "invoices_due_next_days"
 
-    # por vencer / pendientes del mes
     if (("vencen" in t or "vencimiento" in t or "por vencer" in t or "pendiente" in t or "pendientes" in t)
         and ("mes" in t or "mes actual" in t or "este mes" in t)):
         return "invoices_due_this_month"
 
-    # vencidas hoy
     if ("vencid" in t and "hoy" in t):
         return "overdue_today"
 
@@ -187,82 +249,9 @@ def detect_intent(text: str, last_intent: Optional[str] = None) -> str:
 # -----------------------------------------------------------------------------
 # 6) Responder al canal con ConnectorClient (¡sin reply_to_id!)
 # -----------------------------------------------------------------------------
-async def _reply_markdown(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = PAGE_LIMIT):
-    """
-    Envía Markdown con ConnectorClient (SDK 4.14.3):
-    - Usamos send_to_conversation (llamada SINCRÓNICA).
-    - Activity JSON con claves exactas: 'from', 'recipient', 'conversation', 'channelId', 'serviceUrl'.
-    - Credenciales con scope .default y tenant si aplica.
-    """
-    act_in = context.activity
-    su           = getattr(act_in, "service_url", None)
-    channel_id   = getattr(act_in, "channel_id", None)
-    conv_in      = getattr(act_in, "conversation", None)
-    conv_id      = conv_in.id if conv_in else None
-    user_acc     = getattr(act_in, "from_property", None)  # usuario que escribió
-    bot_acc      = getattr(act_in, "recipient", None)      # el bot (este gateway)
-    locale       = getattr(act_in, "locale", None) or DEFAULT_LOCALE
-
-    # Confiar serviceUrl (recomendado por Microsoft)
-    if su:
-        try:
-            MicrosoftAppCredentials.trust_service_url(su)
-        except Exception as e:
-            print(f"[gw] WARN trust_service_url: {e}")
-
-    md = f"{title}\n\n{_markdown_table(cols, rows, limit)}"
-
-    if REPLY_MODE.lower() == "silent":
-        print("[gw] SILENT MODE — markdown construido (no enviado):")
-        print(md[:2000])
-        return
-
-    # Validaciones mínimas
-    if not (su and channel_id and conv_id and user_acc and bot_acc):
-        try:
-            await context.send_activity("⚠️ No se encontró información suficiente del canal para responder.")
-        except Exception as e:
-            print(f"[gw] ERROR send_activity (fallback): {repr(e)}")
-        return
-
-    # Identidades del Activity
-    bot_id   = getattr(bot_acc, "id", None) or APP_ID
-    bot_name = getattr(bot_acc, "name", None) or "Bot"
-    usr_id   = getattr(user_acc, "id", None) or "user"
-    usr_name = getattr(user_acc, "name", None) or "Usuario"
-
-    # Credenciales salientes (scope .default + tenant si aplica)
-    creds = MicrosoftAppCredentials(
-        app_id=APP_ID,
-        password=APP_PWD,
-        channel_auth_tenant=TENANT if (APP_TYPE == "SingleTenant" and TENANT) else None,
-        oauth_scope="https://api.botframework.com/.default",
-    )
-    connector = ConnectorClient(credentials=creds, base_url=su)
-
-    # Activity JSON — OJO: clave 'from' literal
-    reply_activity = {
-        "type": "message",
-        "channelId": channel_id,
-        "serviceUrl": su,
-        "conversation": {"id": conv_id},
-        "from": {"id": bot_id, "name": bot_name, "role": "bot"},
-        "recipient": {"id": usr_id, "name": usr_name, "role": "user"},
-        "textFormat": "markdown",
-        "text": md,
-        "locale": locale,
-    }
-
-    try:
-        # Llamada SINCRÓNICA en 4.14.3 (no usar await)
-        connector.conversations.send_to_conversation(conversation_id=conv_id, activity=reply_activity)
-    except Exception as e:
-        print(f"[gw] ERROR ConnectorClient.send_to_conversation: {repr(e)}")
-        # Último intento con send_activity (puede fallar por credenciales salientes)
-        try:
-            await context.send_activity("⚠️ No pude enviar la respuesta por el canal. Intenta de nuevo.")
-        except Exception as e2:
-            print(f"[gw] ERROR send_activity (fallback tras ConnectorClient): {repr(e2)}")
+def _reply_markdown(context: TurnContext, title: str, cols: List[str], rows: List[Dict[str, Any]], limit: int = PAGE_LIMIT) -> None:
+    """Wrapper que envía tabla markdown usando ConnectorClient."""
+    _send_markdown_table(context, title, cols, rows, limit=limit)
 
 # -----------------------------------------------------------------------------
 # 7) Handler principal de mensajes
@@ -279,15 +268,12 @@ async def on_message(context: TurnContext):
 
     # Ayuda / saludo
     if intent == "help":
-        # resetea last_intent para no arrastrar contexto si solo chatea
-        sess["last_intent"] = None
-        await context.send_activity(_help_text())
+        sess["last_intent"] = None  # resetea contexto
+        _send_text(context, _help_text())
         return
 
     # Filtros detectados
     filters = extract_filters(text)
-
-    # Si el usuario dijo "todo el mes", limpiamos filtros puntuales de día
     if filters.get("whole_month"):
         filters.pop("date_day", None)
 
@@ -303,12 +289,12 @@ async def on_message(context: TurnContext):
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{BACKEND_URL}/n2sql/run", json=payload)
             if r.status_code >= 400:
-                await context.send_activity(f"⚠️ Backend: {r.text}")
+                _send_text(context, f"⚠️ Backend: {r.text}")
                 return
             data = r.json()
     except Exception as e:
         print(f"[gw] ERROR llamando backend: {repr(e)}")
-        await context.send_activity("⚠️ Ocurrió un problema al consultar el backend.")
+        _send_text(context, "⚠️ Ocurrió un problema al consultar el backend.")
         return
 
     cols: List[str] = data.get("columns", []) or []
@@ -316,10 +302,10 @@ async def on_message(context: TurnContext):
     summary: str = data.get("summary", "") or f"{len(rows)} filas."
     title = f"**{intent}** — {summary}"
 
-    # Actualiza last_intent SOLO si hubo resultados o si el intent es válido
+    # Actualiza last_intent para permitir seguimientos
     sess["last_intent"] = intent
 
-    await _reply_markdown(context, title, cols, rows, limit=PAGE_LIMIT)
+    _reply_markdown(context, title, cols, rows, limit=PAGE_LIMIT)
 
 # -----------------------------------------------------------------------------
 # 8) Rutas HTTP (health/diag + BF)
@@ -363,12 +349,7 @@ def diag_msal():
 @app.get("/diag/sdk-token")
 def diag_sdk_token():
     try:
-        creds = MicrosoftAppCredentials(
-            app_id=APP_ID,
-            password=APP_PWD,
-            channel_auth_tenant=TENANT if (APP_TYPE == "SingleTenant" and TENANT) else None,
-            oauth_scope="https://api.botframework.com/.default",
-        )
+        creds = _mk_credentials()
         tok = creds.get_access_token()
         ok = bool(tok)
         prefix = tok[:12] if tok else ""
@@ -397,7 +378,7 @@ async def api_messages(req: Request):
     print(f"[gw] has_auth={bool(auth_header)} from={client}")
 
     async def aux(turn_context: TurnContext):
-        if activity.type == ActivityTypes.message:
+        if turn_context.activity.type == ActivityTypes.message:
             await on_message(turn_context)
         else:
             # otros tipos (conversationUpdate, invoke, etc.) se pueden manejar si hace falta
