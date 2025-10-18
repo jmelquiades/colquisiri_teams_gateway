@@ -1,13 +1,17 @@
 services:
   - type: web
     name: teams-gateway
-    env: docker
+    env: python
     plan: starter
     healthCheckPath: /health
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
     envVars:
-      - key: BACKEND_URL
-        value: https://admin-assistant-npsd.onrender.com
+      - key: N2SQL_URL
+        value: https://n2sql-service.onrender.com   # <-- ajusta con tu URL real
       - key: MICROSOFT_APP_ID
         sync: false
       - key: MICROSOFT_APP_PASSWORD
         sync: false
+      - key: APP_TZ
+        value: America/Lima
