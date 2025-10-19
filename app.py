@@ -249,3 +249,26 @@ app.router.add_get("/diag/authcfg", diag_authcfg)
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     web.run_app(app, host="0.0.0.0", port=port)
+
+# --- Diagnóstico del NLU/N2SQL detrás del bot ---
+import aiohttp, os
+
+N2SQL_URL = os.getenv("N2SQL_URL", os.getenv("N2SQL_URL".upper(), "")) or os.getenv("N2SQL_URL", "")
+
+async def diag_nlu(_: web.Request) -> web.Response:
+    url = N2SQL_URL.rstrip("/")
+    if not url:
+        return web.json_response({"ok": False, "error": "N2SQL_URL missing"}, status=500)
+    try:
+        # Primero /health, si no existe probamos /
+        async with aiohttp.ClientSession() as s:
+            for path in ("/health", "/"):
+                try:
+                    async with s.get(f"{url}{path}", timeout=10) as r:
+                        body = await r.text()
+                        return web.json_response({"ok": r.status < 400, "status": r.status, "path": path, "body": body[:4000]})
+                except Exception:
+                    continue
+        return web.json_response({"ok": False, "error": "No responde /health ni /"}, status=502)
+    except Exception as e:
+        return web.json_response({"ok": False, "exception": str(e)}, status=500)
