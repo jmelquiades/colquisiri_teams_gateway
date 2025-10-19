@@ -1,6 +1,5 @@
-# app.py — Teams Gateway (aiohttp + CloudAdapter, SDK 4.16.x)
+# app.py — Teams Gateway (aiohttp + CloudAdapter, SDK 4.16.1)
 
-import json
 import logging
 import os
 from aiohttp import web
@@ -14,11 +13,9 @@ from botbuilder.schema import Activity
 from botframework.connector.auth import MicrosoftAppCredentials
 
 import msal
-import jwt  # PyJWT para diagnosticar los claims entrantes
+import jwt  # PyJWT para mirar claims sin validar firma
 
-# ----------------------
-# Tu bot (debe tener .on_turn)
-# ----------------------
+# Tu bot (debe definir .on_turn)
 from bot import DataTalkBot
 
 # ----------------------
@@ -30,12 +27,24 @@ logging.basicConfig(
 )
 log = logging.getLogger("teams-gateway")
 
+# (Opcional) Application Insights si existe la env var y el paquete está instalado
+APPINSIGHTS_CS = os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING", "")
+if APPINSIGHTS_CS:
+    try:
+        from opencensus.ext.azure.log_exporter import AzureLogHandler  # type: ignore
+
+        ah = AzureLogHandler(connection_string=APPINSIGHTS_CS)
+        logging.getLogger().addHandler(ah)
+        log.info("Application Insights logging habilitado.")
+    except Exception as e:  # no romper si no está instalado
+        log.warning("No se pudo habilitar Application Insights: %s", e)
+
 # =========================
-# Helpers de configuración
+# Helpers de env
 # =========================
 def _env(name: str, fallback: str = "") -> str:
     """
-    Lee MAYÚSCULAS; si no existe, intenta camelCase (compat Render). Si no, usa fallback.
+    Busca primero MAYÚSCULAS; si no, intenta camelCase (compat Render); si no, fallback.
     """
     return os.getenv(
         name,
@@ -70,26 +79,22 @@ def public_env_snapshot() -> dict:
     for k in keys:
         v = _env(k)
         out[k] = "SET(***masked***)" if v else "MISSING"
-    # extras útiles
     out["EFFECTIVE_APP_ID"] = _env("MICROSOFT_APP_ID")
     out["EFFECTIVE_TENANT"] = _env("MICROSOFT_APP_TENANT_ID")
     out["EFFECTIVE_APP_TYPE"] = _env("MICROSOFT_APP_TYPE", "MultiTenant") or "MultiTenant"
     return out
 
+# =========================
+# Config y Adapter
+# =========================
 APP_ID = _env("MICROSOFT_APP_ID", "")
 APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
-TENANT = _env("MICROSOFT_APP_TENANT_ID")  # vacío si MultiTenant
+TENANT = _env("MICROSOFT_APP_TENANT_ID")  # puede ir vacío en MultiTenant
 APP_TYPE = _env("MICROSOFT_APP_TYPE", "MultiTenant") or "MultiTenant"
-# Scope por defecto del canal BF
 OAUTH_SCOPE = _env("TO_CHANNEL_FROM_BOT_OAUTH_SCOPE", "https://api.botframework.com")
 
-# ----------------------
-# CloudAdapter + Auth config-based
-# ----------------------
 class SimpleConfig:
-    """
-    Implementa .get(key, default) para ConfigurationBotFrameworkAuthentication.
-    """
+    """Objeto minimalista con .get(k, default) para ConfigurationBotFrameworkAuthentication."""
     def __init__(self):
         self._d = {
             "MicrosoftAppId": APP_ID,
@@ -121,29 +126,26 @@ async def on_error(context: TurnContext, error: Exception):
 adapter.on_turn_error = on_error
 
 # ==========
-# Utils diag
+# JWT peek (solo diagnóstico)
 # ==========
-def _peek_jwt(auth_header: str) -> dict:
-    """
-    Decodifica el JWT del header (sin validar firma) para ver claims básicos.
-    """
+def _peek_jwt(auth_header: str) -> None:
     try:
         if not auth_header or not auth_header.lower().startswith("bearer "):
-            return {}
+            return
         token = auth_header.split(" ", 1)[1]
-        claims = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
-        return {
-            "iss": claims.get("iss"),
-            "aud": claims.get("aud"),
-            "appid": claims.get("appid") or claims.get("azp"),
-            "tid": claims.get("tid"),
-            "ver": claims.get("ver"),
-        }
-    except Exception:
-        return {}
+        hdr = jwt.get_unverified_header(token)
+        claims = jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
+        appid = claims.get("appid") or claims.get("azp")
+        log.info(
+            "[JWT] iss=%s | aud=%s | appid=%s | tid=%s | ver=%s",
+            claims.get("iss"), claims.get("aud"), appid, claims.get("tid"), claims.get("ver")
+        )
+        log.debug("[JWT hdr] kid=%s alg=%s", hdr.get("kid"), hdr.get("alg"))
+    except Exception as e:
+        log.warning("[JWT] peek error: %s", e)
 
 # ==========
-# Handlers
+# Handlers HTTP
 # ==========
 async def messages(req: web.Request) -> web.Response:
     if "application/json" not in req.headers.get("Content-Type", ""):
@@ -158,39 +160,29 @@ async def messages(req: web.Request) -> web.Response:
     service_url = getattr(activity, "service_url", "")
 
     normalized = recipient_raw
-    if channel_id == "msteams" and recipient_raw.startswith("28:"):
+    if channel_id == "msteams" and isinstance(recipient_raw, str) and recipient_raw.startswith("28:"):
         normalized = recipient_raw.split("28:")[-1]
 
     log.info(
         "[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | channel=%s | serviceUrl=%s",
-        APP_ID,
-        recipient_raw,
-        channel_id,
-        service_url,
+        APP_ID, recipient_raw, channel_id, service_url
     )
     if channel_id == "msteams":
         log.info("[DIAG][msteams] normalized=%s", normalized)
 
-    # Ver los claims que llegan del canal (ayuda a diagnosticar Invalid AppId)
-    claims = _peek_jwt(auth_header)
-    if claims:
-        log.info("[JWT] iss=%s | aud=%s | appid=%s | tid=%s | ver=%s",
-                 claims.get("iss"), claims.get("aud"), claims.get("appid"),
-                 claims.get("tid"), claims.get("ver"))
+    # Decodificar el JWT entrante (solo logging, sin validar firma)
+    _peek_jwt(auth_header)
 
-    # Confiar el serviceUrl para poder responder
+    # Confiar el serviceUrl para respuestas salientes
     try:
         MicrosoftAppCredentials.trust_service_url(service_url)
     except Exception as e:
         log.warning("trust_service_url error: %s", e)
 
     async def aux(turn_context: TurnContext):
-        try:
-            await bot.on_turn(turn_context)
-        except Exception:
-            raise  # que lo capture on_turn_error
+        await bot.on_turn(turn_context)
 
-    # Orden correcto (auth_header, activity, callback)
+    # Orden esperado por CloudAdapter: (auth_header, activity, callback)
     await adapter.process_activity(auth_header, activity, aux)
     return web.Response(status=201)
 
@@ -235,7 +227,7 @@ async def diag_msal_bf(_: web.Request) -> web.Response:
         return web.json_response({"ok": False, "exception": str(e)}, status=500)
 
 # ==========
-# App AIOHTTP
+# AIOHTTP app
 # ==========
 app = web.Application()
 app.router.add_post("/api/messages", messages)
@@ -249,5 +241,5 @@ app.router.add_get("/diag/msal-bf", diag_msal_bf)
 # Main
 # ==========
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))  # Render inyecta PORT (10000). En local usa 8000.
+    port = int(os.getenv("PORT", "8000"))  # Render inyecta PORT (p.ej. 10000). En local: 8000.
     web.run_app(app, host="0.0.0.0", port=port)
