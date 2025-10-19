@@ -11,7 +11,7 @@ aiohttp==3.9.5
 typing-extensions==4.12.2
 packaging==24.1
 
-# Bot Framework (CloudAdapter)
+# Bot Framework (Adapter clásico)
 botbuilder-core==4.14.3
 botbuilder-schema==4.14.3
 botframework-connector==4.14.3
