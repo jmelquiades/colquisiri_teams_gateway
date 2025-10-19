@@ -1,19 +1,20 @@
-# Base HTTP
 fastapi==0.110.0
 uvicorn==0.27.1
 
-# Auth/MSAL
 msal==1.34.0
 PyJWT==2.8.0
 requests==2.32.5
 
-# Bot Builder (pila ESTABLE 4.14.x, sin CloudAdapter)
+# Bot Builder estable 4.14.x (sin CloudAdapter)
 botbuilder-core==4.14.7
 botbuilder-schema==4.14.7
 botframework-connector==4.14.7
 botframework-streaming==4.14.7
 
-# Dependencias de botframework
+# Dependencias del conector
 jsonpickle==1.4.2
 msrest==0.7.1
 urllib3==1.26.20
+
+# NECESARIO para el cliente HTTP de msrest/botframework
+aiohttp==3.8.5
