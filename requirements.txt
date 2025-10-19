@@ -1,7 +1,6 @@
-aiohttp==3.7.4.post0
+aiohttp==3.9.5
 botbuilder-core==4.14.3
 botbuilder-schema==4.14.3
-botbuilder-integration-aiohttp==4.14.3
 botframework-connector==4.14.3
 msrest==0.6.21
 requests==2.32.3
