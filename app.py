@@ -1,4 +1,5 @@
 # app.py — Teams Gateway (aiohttp + BotFrameworkAdapter, SDK 4.14.x)
+# Fix: puentea variables de entorno a camelCase para el SDK (MicrosoftAppId/Password/TenantId/Type)
 
 import os
 from aiohttp import web
@@ -32,6 +33,22 @@ def _env(name: str, fallback: str = "") -> str:
     )
 
 
+def bridge_env_vars():
+    """
+    Asegura que si solo seteaste MICROSOFT_*,
+    el SDK también vea las claves camelCase Microsoft*.
+    """
+    mapping = [
+        ("MICROSOFT_APP_ID", "MicrosoftAppId"),
+        ("MICROSOFT_APP_PASSWORD", "MicrosoftAppPassword"),
+        ("MICROSOFT_APP_TENANT_ID", "MicrosoftAppTenantId"),
+        ("MICROSOFT_APP_TYPE", "MicrosoftAppType"),
+    ]
+    for upper, camel in mapping:
+        if os.getenv(upper) and not os.getenv(camel):
+            os.environ[camel] = os.getenv(upper)
+
+
 def public_env_snapshot() -> dict:
     """
     Snapshot seguro del entorno: indica si existen variables críticas
@@ -50,10 +67,13 @@ def public_env_snapshot() -> dict:
     ]
     out = {}
     for k in keys:
-        v = _env(k)
+        v = os.getenv(k)
         out[k] = "SET(***masked***)" if v else "MISSING"
     return out
 
+
+# Puentea variables antes de leerlas
+bridge_env_vars()
 
 # =====================================
 # Credenciales (AppId / Password AAD)
@@ -100,7 +120,6 @@ async def messages(req: web.Request) -> web.Response:
         await bot.on_turn(turn_context)
 
     # ORDEN CORRECTO: (activity, auth_header, callback)
-    # ¡Esto evita el TypeError: parse_request(): received invalid request!
     await adapter.process_activity(activity, auth_header, aux_func)
     return web.Response(status=201)
 
@@ -132,7 +151,6 @@ async def diag_msal(_: web.Request) -> web.Response:
         )
         token = appc.acquire_token_for_client(scopes=SCOPE)
         ok = "access_token" in token
-        # Para depurar por qué el SDK no ve las vars, indicamos si encontró camelCase
         sdk_env_seen = {
             "MicrosoftAppId": bool(os.getenv("MicrosoftAppId")),
             "MicrosoftAppPassword": bool(os.getenv("MicrosoftAppPassword")),
