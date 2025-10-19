@@ -3,3 +3,6 @@ msal>=1.28
 botbuilder-core==4.14.7
 botbuilder-schema==4.14.7
 botbuilder-integration-aiohttp==4.14.7
+botframework-connector==4.14.7
+# (opcional, solo para /diag/token)
+# pyjwt>=2.8
