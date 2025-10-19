@@ -1,5 +1,5 @@
 # app.py — Teams Gateway (aiohttp + BotFrameworkAdapter, SDK 4.14.x)
-# Añade diagnóstico de AppId/recipientId para detectar 401 por credenciales cruzadas.
+# Normaliza recipient.id (strip "28:") y añade trazas útiles.
 
 import os
 import logging
@@ -47,8 +47,8 @@ def public_env_snapshot() -> dict:
 
 bridge_env_vars()
 
-APP_ID = _env("MICROSOFT_APP_ID", "")
-APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
+APP_ID = _env("MICROSOFT_APP_ID", "").strip()
+APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "").strip()
 
 adapter = BotFrameworkAdapter(BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD))
 bot = DataTalkBot()
@@ -62,6 +62,11 @@ async def on_error(context: TurnContext, error: Exception):
 
 adapter.on_turn_error = on_error
 
+def _normalize_bot_id(raw_id: str | None) -> str | None:
+    if not raw_id:
+        return raw_id
+    return raw_id[3:] if raw_id.startswith("28:") else raw_id
+
 async def messages(req: web.Request) -> web.Response:
     if "application/json" not in req.headers.get("Content-Type", ""):
         return web.Response(status=415, text="Content-Type must be application/json")
@@ -70,23 +75,23 @@ async def messages(req: web.Request) -> web.Response:
     activity: Activity = Activity().deserialize(body)
     auth_header = req.headers.get("Authorization", "")
 
-    # === DIAGNÓSTICO CLAVE ===
-    # recipient.id = AppId del bot para el cual va dirigido el mensaje
-    rec_id = getattr(activity.recipient, "id", None)
+    rec_id_raw = getattr(activity.recipient, "id", None)
+    rec_id = _normalize_bot_id(rec_id_raw)
     svc_url = getattr(activity, "service_url", None)
     chan_id = getattr(activity, "channel_id", None)
-    log.info("[DIAG] Our APP_ID=%s | activity.recipient.id=%s | channel=%s | serviceUrl=%s",
-             APP_ID, rec_id, chan_id, svc_url)
 
-    # Si no coincide, casi seguro 401 al responder:
+    log.info("[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | normalized=%s | channel=%s | serviceUrl=%s",
+             APP_ID, rec_id_raw, rec_id, chan_id, svc_url)
+
+    # Solo alertamos si tras normalizar aún difiere
     if rec_id and APP_ID and rec_id != APP_ID:
-        log.error("[MISMATCH] Mensaje dirigido a bot %s, pero este proceso firma como %s. Revisa AppId/secreto.",
+        log.error("[MISMATCH] Mensaje para botId=%s, pero proceso firma como=%s. Revisa AppId/secret/manifest.",
                   rec_id, APP_ID)
 
     async def aux_func(turn_context: TurnContext):
         await bot.on_turn(turn_context)
 
-    # Orden: (activity, auth_header, callback)
+    # Orden correcto: (activity, auth_header, callback)
     await adapter.process_activity(activity, auth_header, aux_func)
     return web.Response(status=201)
 
