@@ -4,16 +4,15 @@ import logging
 import os
 from aiohttp import web
 
-from botbuilder.core import (
-    TurnContext,
-    Configuration,
-    ConfigurationBotFrameworkAuthentication,
-)
+from botbuilder.core import TurnContext
 from botbuilder.schema import Activity
 from botframework.connector.auth import MicrosoftAppCredentials
 
-# CloudAdapter para aiohttp
+# CloudAdapter y Auth (aiohttp)
 from botbuilder.integration.aiohttp import CloudAdapter
+from botbuilder.integration.aiohttp.configuration_bot_framework_authentication import (
+    ConfigurationBotFrameworkAuthentication,
+)
 
 import msal
 
@@ -38,9 +37,9 @@ log = logging.getLogger("teams-gateway")
 # =========================
 def _propagate_env_aliases():
     """
-    CloudAdapter (ConfigurationBotFrameworkAuthentication) busca por defecto
-    variables camelCase. Si solo configuras MAYÚSCULAS en Render, aquí las
-    copiamos como alias para evitar confusiones.
+    CloudAdapter (ConfigurationBotFrameworkAuthentication) espera variables camelCase.
+    Si solo configuras MAYÚSCULAS en Render, aquí las copiamos como alias para que
+    las encuentre.
     """
     aliases = [
         ("MICROSOFT_APP_ID", "MicrosoftAppId"),
@@ -69,12 +68,27 @@ APP_ID = os.getenv("MicrosoftAppId") or os.getenv("MICROSOFT_APP_ID", "")
 # Instancia del bot
 bot = DataTalkBot()
 
+
+# ----------------------
+# Config simple basada en os.environ
+# ----------------------
+class EnvConfiguration:
+    """
+    Mínima implementación que provee .get(key, default) para
+    ConfigurationBotFrameworkAuthentication.
+    """
+    def __init__(self, env):
+        self._env = env
+
+    def get(self, key: str, default=None):
+        return self._env.get(key, default)
+
+
 # ==========================
 # Adapter (CloudAdapter) + Auth
 # ==========================
-# En 4.14.x, ConfigurationBotFrameworkAuthentication requiere un Configuration
-config = Configuration(os.environ)
-auth = ConfigurationBotFrameworkAuthentication(config)
+config = EnvConfiguration(os.environ)
+auth = ConfigurationBotFrameworkAuthentication(config)  # lee MicrosoftAppId/Password, etc. desde ENV
 adapter = CloudAdapter(auth)
 
 
