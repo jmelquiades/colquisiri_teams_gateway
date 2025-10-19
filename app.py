@@ -1,13 +1,12 @@
-# app.py — Teams Gateway (aiohttp + BotFrameworkAdapter)
+# app.py — Teams Gateway (aiohttp + BotFrameworkAdapter, SDK 4.14.x)
 
 import os
 from aiohttp import web
-from botbuilder.core import TurnContext
-from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter
+from botbuilder.core import TurnContext, BotFrameworkAdapter, BotFrameworkAdapterSettings
 from botbuilder.schema import Activity
 import msal
 
-# --- Tu bot principal (debe exponer .on_turn) ---
+# Tu bot principal (debe exponer .on_turn)
 from bot import DataTalkBot
 
 
@@ -35,7 +34,7 @@ def _env(name: str, fallback: str = "") -> str:
 
 def public_env_snapshot() -> dict:
     """
-    Muestra un snapshot seguro del entorno: indica si existen variables críticas
+    Snapshot seguro del entorno: indica si existen variables críticas
     sin revelar sus valores. Útil para /diag/env.
     """
     keys = [
@@ -58,9 +57,8 @@ def public_env_snapshot() -> dict:
 APP_ID = _env("MICROSOFT_APP_ID", "")
 APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
 
-# Adapter clásico (estable con el SDK que tienes)
-settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
-adapter = BotFrameworkAdapter(settings)
+# Adapter clásico (estable con SDK 4.14.x)
+adapter = BotFrameworkAdapter(BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD))
 
 # Instancia del bot
 bot = DataTalkBot()
@@ -86,6 +84,7 @@ adapter.on_turn_error = on_error
 # Handlers
 # ==========
 async def messages(req: web.Request) -> web.Response:
+    # Acepta "application/json" y variantes con charset
     if "application/json" not in req.headers.get("Content-Type", ""):
         return web.Response(status=415, text="Content-Type must be application/json")
 
@@ -96,7 +95,8 @@ async def messages(req: web.Request) -> web.Response:
     async def aux_func(turn_context: TurnContext):
         await bot.on_turn(turn_context)
 
-    await adapter.process_activity(activity, auth_header, aux_func)
+    # MUY IMPORTANTE: orden correcto (auth_header, activity, callback)
+    await adapter.process_activity(auth_header, activity, aux_func)
     return web.Response(status=201)
 
 
@@ -125,7 +125,7 @@ async def diag_msal(_: web.Request) -> web.Response:
         ok = "access_token" in token
         payload = {"ok": ok, "keys": list(token.keys())}
         if not ok:
-            payload["error"] = token  # aquí verás invalid_client / unauthorized_client, etc.
+            payload["error"] = token  # verás unauthorized_client/invalid_client, etc.
         return web.json_response(payload, status=200 if ok else 500)
     except Exception as e:
         return web.json_response({"ok": False, "exception": str(e)}, status=500)
