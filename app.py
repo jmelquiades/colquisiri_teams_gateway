@@ -1,227 +1,151 @@
-# app.py — Teams Gateway (FastAPI + BotFrameworkAdapter 4.14.x)
-
 import os
-import json
+import re
 import logging
-from typing import Dict
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+import aiohttp
+from fastapi import FastAPI, Body, HTTPException
+from pydantic import BaseModel
 
-from botbuilder.core import (
-    BotFrameworkAdapter,
-    BotFrameworkAdapterSettings,
-    ActivityHandler,
-    TurnContext,
-    MessageFactory,
-)
-from botbuilder.schema import Activity
-from botframework.connector.auth import MicrosoftAppCredentials
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("teams-gateway-lite")
 
-import msal
+app = FastAPI(title="Gateway (NLU/N2SQL mode)", version="1.0.0")
 
-# ----------------------
-# Logging básico
-# ----------------------
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(levelname)s:%(name)s:%(message)s",
-)
-log = logging.getLogger("teams-gateway")
+# ---------- utils ----------
+SENSITIVE = {"OPENAI_API_KEY", "N2SQL_API_KEY"}
 
+def _mask(v: Optional[str], key: str) -> str:
+    if v is None:
+        return "MISSING"
+    if key in SENSITIVE:
+        return f"SET({v[:3]}***{v[-2:]})" if len(v) >= 6 else "SET(***masked***)"
+    return v
 
-# =========================
-# Helpers de configuración
-# =========================
-def _env(name: str, fallback: str = "") -> str:
-    """
-    Lee primero MAYÚSCULAS; si no existe, intenta camelCase (compat Render).
-    """
-    return os.getenv(
-        name,
-        os.getenv(
-            {
-                "MICROSOFT_APP_ID": "MicrosoftAppId",
-                "MICROSOFT_APP_PASSWORD": "MicrosoftAppPassword",
-                "MICROSOFT_APP_TENANT_ID": "MicrosoftAppTenantId",
-                "MICROSOFT_APP_TYPE": "MicrosoftAppType",
-                "TO_CHANNEL_FROM_BOT_OAUTH_SCOPE": "ToChannelFromBotOAuthScope",
-            }.get(name, ""),
-            fallback,
-        ),
-    )
-
-
-def public_env_snapshot() -> Dict[str, str]:
+def diag_env() -> Dict[str, str]:
     keys = [
-        "MICROSOFT_APP_ID",
-        "MICROSOFT_APP_PASSWORD",
-        "MICROSOFT_APP_TENANT_ID",
-        "MICROSOFT_APP_TYPE",
-        "TO_CHANNEL_FROM_BOT_OAUTH_SCOPE",
-        "MicrosoftAppId",
-        "MicrosoftAppPassword",
-        "MicrosoftAppTenantId",
-        "MicrosoftAppType",
-        "ToChannelFromBotOAuthScope",
+        "APP_TZ",
+        "N2SQL_URL",
+        "N2SQL_API_KEY",
+        "OPENAI_API_KEY",
         "PORT",
     ]
-    out = {}
-    for k in keys:
-        v = _env(k)
-        out[k] = "SET(***masked***)" if v else "MISSING"
-    # Derivados útiles
-    out["EFFECTIVE_APP_ID"] = _env("MICROSOFT_APP_ID")
-    out["EFFECTIVE_TENANT"] = _env("MICROSOFT_APP_TENANT_ID")
-    out["EFFECTIVE_APP_TYPE"] = _env("MICROSOFT_APP_TYPE") or "MultiTenant"
-    return out
+    return {k: _mask(os.getenv(k), k) for k in keys}
 
-
-# =====================================
-# Credenciales y “airbag” de scope
-# =====================================
-# Airbag: si el scope no está en env, lo ponemos nosotros para 4.14.x
-os.environ.setdefault(
-    "ToChannelFromBotOAuthScope", "https://api.botframework.com/.default"
-)
-os.environ.setdefault(
-    "TO_CHANNEL_FROM_BOT_OAUTH_SCOPE", "https://api.botframework.com/.default"
-)
-
-APP_ID = _env("MICROSOFT_APP_ID", "")
-APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
-
-adapter = BotFrameworkAdapter(BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD))
-
-
-# ===============
-# Bot sencillo
-# ===============
-class EchoBot(ActivityHandler):
-    async def on_message_activity(self, turn_context: TurnContext):
-        text = (turn_context.activity.text or "").strip()
-        await turn_context.send_activity(MessageFactory.text(f"ECO: {text}"))
-
-
-bot = EchoBot()
-
-
-# ==========================
-# Manejo global de errores
-# ==========================
-async def on_error(context: TurnContext, error: Exception):
-    log.error("[BOT ERROR] %s", error, exc_info=True)
-    try:
-        await context.send_activity(
-            "Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo."
-        )
-    except Exception as e:
-        log.error("[BOT ERROR][send_activity] %s", e, exc_info=True)
-
-
-adapter.on_turn_error = on_error
-
-
-# ==========
-# FastAPI
-# ==========
-app = FastAPI()
-
-
+# ---------- health/diag ----------
 @app.get("/health")
-async def health():
+def health():
     log.info("Health check solicitado.")
     return {"ok": True}
 
-
 @app.get("/diag/env")
-async def diag_env():
-    return JSONResponse(public_env_snapshot())
+def diag_env_route():
+    return diag_env()
 
+@app.get("/")
+def root():
+    return {"service": "Gateway NLU/N2SQL", "ok": True}
 
-# --- Diagnósticos MSAL (para validar secreto y tenant) ---
-TENANT = _env("MICROSOFT_APP_TENANT_ID") or "organizations"
-AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT}"
-AUTH_BF = "https://login.microsoftonline.com/botframework.com"
-SCOPE = ["https://api.botframework.com/.default"]
+# ---------- NLU (reglas simples) ----------
+class NLUIn(BaseModel):
+    text: str
 
+def simple_nlu(text: str) -> Dict[str, Any]:
+    t = text.strip()
+    low = t.lower()
 
-@app.get("/diag/msal")
-async def diag_msal():
-    try:
-        appc = msal.ConfidentialClientApplication(
-            client_id=APP_ID, client_credential=APP_PASSWORD, authority=AUTH_TENANT
+    # intent heurístico
+    if re.search(r"\b(hola|hello|buenas)\b", low):
+        intent, conf = "greet", 0.95
+    elif re.search(r"\b(incidente|ticket|reporte|case)\b", low):
+        intent, conf = "create_incident", 0.85
+    elif re.search(r"\b(saldo|balance|cuenta)\b", low):
+        intent, conf = "check_balance", 0.80
+    elif re.search(r"\b(ayuda|help|soporte)\b", low):
+        intent, conf = "help", 0.80
+    else:
+        intent, conf = "fallback", 0.20
+
+    # entidades heurísticas
+    entities: Dict[str, Any] = {}
+    nums = re.findall(r"\b\d{5,}\b", t)
+    if nums:
+        entities["numbers"] = nums
+    emails = re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", t)
+    if emails:
+        entities["emails"] = emails
+    dates = re.findall(r"\b(?:\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})\b", t)
+    if dates:
+        entities["dates"] = dates
+
+    return {
+        "text": t,
+        "intent": intent,
+        "confidence": conf,
+        "entities": entities,
+    }
+
+@app.post("/nlu/parse")
+async def nlu_parse(inp: NLUIn):
+    return {"engine": "rule-based", "result": simple_nlu(inp.text)}
+
+@app.get("/nlu/demo")
+def nlu_demo(q: str = "hola, quiero abrir un incidente 12345 para juan@acme.com"):
+    return {"engine": "rule-based", "result": simple_nlu(q)}
+
+# ---------- N2SQL ----------
+class N2SQLIn(BaseModel):
+    question: str
+    passthrough: bool = True  # si True y hay N2SQL_URL, reenvía
+
+def heuristic_sql(q: str) -> str:
+    l = q.lower()
+    if "incidente" in l or "ticket" in l or "reporte" in l:
+        return (
+            "SELECT id, title, status, created_at "
+            "FROM incidents "
+            "WHERE created_at >= CURRENT_DATE - INTERVAL '30 days' "
+            "ORDER BY created_at DESC LIMIT 50;"
         )
-        token = appc.acquire_token_for_client(scopes=SCOPE)
-        ok = "access_token" in token
-        payload = {"ok": ok, "keys": list(token.keys()), "authority": AUTH_TENANT}
-        if not ok:
-            payload["error"] = {k: v for k, v in token.items() if k != "access_token"}
-        return JSONResponse(payload, status_code=200 if ok else 500)
-    except Exception as e:
-        return JSONResponse({"ok": False, "exception": str(e)}, status_code=500)
-
-
-@app.get("/diag/msal-bf")
-async def diag_msal_bf():
-    try:
-        appc = msal.ConfidentialClientApplication(
-            client_id=APP_ID, client_credential=APP_PASSWORD, authority=AUTH_BF
+    if "saldo" in l or "balance" in l:
+        return (
+            "SELECT account_id, balance FROM accounts "
+            "WHERE account_id = :account_id;  -- TODO: pasar account_id"
         )
-        token = appc.acquire_token_for_client(scopes=SCOPE)
-        ok = "access_token" in token
-        payload = {"ok": ok, "keys": list(token.keys()), "authority": AUTH_BF}
-        if not ok:
-            payload["error"] = {k: v for k, v in token.items() if k != "access_token"}
-        return JSONResponse(payload, status_code=200 if ok else 500)
-    except Exception as e:
-        return JSONResponse({"ok": False, "exception": str(e)}, status_code=500)
+    if "usuarios" in l and ("activos" in l or "actives" in l):
+        return "SELECT id, email, last_login FROM users WHERE is_active = true;"
+    return "-- sin mapeo heurístico; amplía reglas o usa N2SQL_URL"
 
+@app.post("/n2sql/run")
+async def n2sql_run(inp: N2SQLIn):
+    url = os.getenv("N2SQL_URL")
+    api_key = os.getenv("N2SQL_API_KEY")
 
-# ==========
-# Endpoint de Teams
-# ==========
-@app.post("/api/messages")
-async def messages(request: Request):
-    if "application/json" not in (request.headers.get("Content-Type") or ""):
-        return PlainTextResponse("Content-Type must be application/json", status_code=415)
+    if inp.passthrough and url:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        payload = {"question": inp.question}
 
-    body = await request.json()
-    activity: Activity = Activity().deserialize(body)
-    auth_header = request.headers.get("Authorization", "")
-
-    # Diag mínimo
-    recipient_raw = getattr(activity.recipient, "id", "")
-    channel_id = getattr(activity, "channel_id", "")
-    service_url = getattr(activity, "service_url", "")
-
-    normalized = recipient_raw
-    if channel_id == "msteams" and recipient_raw.startswith("28:"):
-        normalized = recipient_raw.split("28:")[-1]
-
-    log.info(
-        "[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | channel=%s | serviceUrl=%s",
-        APP_ID,
-        recipient_raw,
-        channel_id,
-        service_url,
-    )
-    if channel_id == "msteams":
-        log.info("[DIAG][msteams] normalized=%s", normalized)
-
-    # Muy importante: confiar el serviceUrl antes de responder
-    try:
-        if service_url:
-            MicrosoftAppCredentials.trust_service_url(service_url)
-    except Exception as e:
-        log.warning("trust_service_url(%s) fallo: %s", service_url, e)
-
-    async def aux(turn_context: TurnContext):
         try:
-            await bot.on_turn(turn_context)
-        except Exception as ex:
-            log.error("[BOT ERROR] %s", ex, exc_info=True)
-            raise
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(url, json=payload, headers=headers, timeout=20) as r:
+                    # no asumimos content-type exacto
+                    try:
+                        data = await r.json(content_type=None)
+                    except Exception:
+                        data = {"raw": await r.text()}
+                    return {
+                        "mode": "passthrough",
+                        "upstream_status": r.status,
+                        "data": data,
+                    }
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"n2sql upstream error: {e}")
 
-    await adapter.process_activity(activity, auth_header, aux)
-    return Response(status_code=201)
+    # fallback heurístico si no hay N2SQL_URL o passthrough=False
+    return {"mode": "heuristic", "sql": heuristic_sql(inp.question)}
+
+@app.get("/n2sql/demo")
+def n2sql_demo(q: str = "listar incidentes abiertos este mes"):
+    return {"question": q, "sql": heuristic_sql(q)}

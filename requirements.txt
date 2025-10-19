@@ -1,22 +1,4 @@
-# Core web
 fastapi==0.110.0
 uvicorn==0.29.0
-
-# HTTP
-requests==2.31.0
-aiohttp>=3.8,<3.11
-python-multipart
-
-# MSAL para diagnósticos
-msal==1.34.0
-
-# Bot Framework SDK 4.14.x (conjuntos compatibles)
-botbuilder-core==4.14.3
-botbuilder-schema==4.14.3
-botframework-connector==4.14.3
-botframework-streaming==4.14.3
-
-# Dependencias de compatibilidad que evitan conflictos
-jsonpickle==1.4.2
-msrest==0.6.21
-urllib3<2.0.0
+aiohttp==3.10.5
+pydantic==2.6.4
