@@ -1,19 +1,44 @@
 # app.py — Teams Gateway (aiohttp + BotFrameworkAdapter, SDK 4.14.x)
-# - Compara recipient.id ~ AppId SOLO en channel 'msteams'
-# - Trazas de diagnóstico útiles
 
-import os
+import json
 import logging
+import os
 from aiohttp import web
-from botbuilder.core import TurnContext, BotFrameworkAdapter, BotFrameworkAdapterSettings
+
+from botbuilder.core import (
+    TurnContext,
+    BotFrameworkAdapter,
+    BotFrameworkAdapterSettings,
+)
 from botbuilder.schema import Activity
+from botframework.connector.auth import MicrosoftAppCredentials
+
 import msal
+
+# ----------------------
+# Tu bot (debe tener .on_turn)
+# ----------------------
 from bot import DataTalkBot
 
-logging.basicConfig(level=logging.INFO)
+
+# ----------------------
+# Logging básico
+# ----------------------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(levelname)s:%(name)s:%(message)s",
+)
 log = logging.getLogger("teams-gateway")
 
+
+# =========================
+# Helpers de configuración
+# =========================
 def _env(name: str, fallback: str = "") -> str:
+    """
+    Lee primero MAYÚSCULAS; si no existe, intenta camelCase (por compatibilidad
+    con variables ya creadas en Render). Si no, usa fallback.
+    """
     return os.getenv(
         name,
         os.getenv(
@@ -27,48 +52,66 @@ def _env(name: str, fallback: str = "") -> str:
         ),
     )
 
-def bridge_env_vars():
-    mapping = [
-        ("MICROSOFT_APP_ID", "MicrosoftAppId"),
-        ("MICROSOFT_APP_PASSWORD", "MicrosoftAppPassword"),
-        ("MICROSOFT_APP_TENANT_ID", "MicrosoftAppTenantId"),
-        ("MICROSOFT_APP_TYPE", "MicrosoftAppType"),
-    ]
-    for upper, camel in mapping:
-        if os.getenv(upper) and not os.getenv(camel):
-            os.environ[camel] = os.getenv(upper)
 
 def public_env_snapshot() -> dict:
+    """
+    Snapshot seguro del entorno: indica si existen variables críticas
+    sin revelar sus valores. Útil para /diag/env.
+    """
     keys = [
-        "MICROSOFT_APP_ID","MICROSOFT_APP_PASSWORD","MICROSOFT_APP_TENANT_ID","MICROSOFT_APP_TYPE",
-        "MicrosoftAppId","MicrosoftAppPassword","MicrosoftAppTenantId","MicrosoftAppType",
+        "MICROSOFT_APP_ID",
+        "MICROSOFT_APP_PASSWORD",
+        "MICROSOFT_APP_TENANT_ID",
+        "MICROSOFT_APP_TYPE",
+        "MicrosoftAppId",
+        "MicrosoftAppPassword",
+        "MicrosoftAppTenantId",
+        "MicrosoftAppType",
         "PORT",
     ]
-    return {k: ("SET(***masked***)" if os.getenv(k) else "MISSING") for k in keys}
+    out = {}
+    for k in keys:
+        v = _env(k)
+        out[k] = "SET(***masked***)" if v else "MISSING"
+    return out
 
-bridge_env_vars()
 
-APP_ID = _env("MICROSOFT_APP_ID", "").strip()
-APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "").strip()
+# =====================================
+# Credenciales (AppId / Password AAD)
+# =====================================
+APP_ID = _env("MICROSOFT_APP_ID", "")
+APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
 
+# Adapter clásico (estable con SDK 4.14.x)
 adapter = BotFrameworkAdapter(BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD))
+
+# Instancia del bot
 bot = DataTalkBot()
 
+
+# ==========================
+# Manejo global de errores
+# ==========================
 async def on_error(context: TurnContext, error: Exception):
+    # Si el SDK lanzó ErrorResponseException, intentamos sacar cuerpo
     log.error("[BOT ERROR] %s", error, exc_info=True)
+
     try:
-        await context.send_activity("Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo.")
+        await context.send_activity(
+            "Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo."
+        )
     except Exception as e:
         log.error("[BOT ERROR][send_activity] %s", e, exc_info=True)
 
+
 adapter.on_turn_error = on_error
 
-def _normalize_bot_id_for_teams(raw_id: str | None) -> str | None:
-    if not raw_id:
-        return raw_id
-    return raw_id[3:] if raw_id.startswith("28:") else raw_id
 
+# ==========
+# Handlers
+# ==========
 async def messages(req: web.Request) -> web.Response:
+    # Acepta "application/json" y variantes con charset
     if "application/json" not in req.headers.get("Content-Type", ""):
         return web.Response(status=415, text="Content-Type must be application/json")
 
@@ -76,63 +119,119 @@ async def messages(req: web.Request) -> web.Response:
     activity: Activity = Activity().deserialize(body)
     auth_header = req.headers.get("Authorization", "")
 
-    rec_id_raw = getattr(activity.recipient, "id", None)
-    svc_url = getattr(activity, "service_url", None)
-    chan_id = getattr(activity, "channel_id", None)
+    # ---- Diagnóstico útil en cada llegada ----
+    recipient_raw = getattr(activity.recipient, "id", "")
+    channel_id = getattr(activity, "channel_id", "")
+    service_url = getattr(activity, "service_url", "")
 
-    # Diagnóstico base
+    # Normalización para Teams: en Teams el recipient suele ser "28:{appId}"
+    normalized = recipient_raw
+    if channel_id == "msteams" and recipient_raw.startswith("28:"):
+        normalized = recipient_raw.split("28:")[-1]
+
     log.info(
         "[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | channel=%s | serviceUrl=%s",
-        APP_ID, rec_id_raw, chan_id, svc_url
+        APP_ID,
+        recipient_raw,
+        channel_id,
+        service_url,
     )
+    if channel_id == "msteams":
+        log.info("[DIAG][msteams] normalized=%s", normalized)
 
-    # SOLO en Teams tiene sentido comparar contra AppId (formato 28:<APP_ID>)
-    if chan_id == "msteams":
-        rec_norm = _normalize_bot_id_for_teams(rec_id_raw)
-        log.info("[DIAG][msteams] normalized=%s", rec_norm)
-        if rec_norm and APP_ID and rec_norm != APP_ID:
-            log.error(
-                "[MISMATCH][msteams] Mensaje para botId=%s, pero proceso firma como=%s. Revisa AppId/secret/manifest.",
-                rec_norm, APP_ID
-            )
+    # Comprobación de mismatch (evita que un bot se intente usar con otro AppId)
+    if channel_id in ("msteams", "skype"):
+        target = normalized
+    else:
+        target = recipient_raw  # p.ej. webchat usa un botId diferente (hash)
+
+    if target and APP_ID and target != APP_ID:
+        log.error(
+            "[MISMATCH] Mensaje para botId=%s, pero proceso firma como=%s. Revisa AppId/secret/manifest.",
+            target,
+            APP_ID,
+        )
+        # Aun así seguimos el turno para poder ver el 401 con detalle
+        # (no devolvemos 401 aquí para no cortar telemetría)
+
+    # MUY IMPORTANTE: confiar en el serviceUrl antes de enviar respuestas
+    # (algunos endpoints de Teams/WebChat requieren trust explícito)
+    try:
+        MicrosoftAppCredentials.trust_service_url(service_url)
+    except Exception as e:
+        log.warning("No se pudo registrar trust_service_url(%s): %s", service_url, e)
 
     async def aux_func(turn_context: TurnContext):
-        await bot.on_turn(turn_context)
+        try:
+            await bot.on_turn(turn_context)
+        except Exception as ex:
+            # Si el bot falla enviando (401), lo verás con stack + contenido abajo
+            log.error("[BOT ERROR] %s", ex, exc_info=True)
+            # Propagamos para que on_error también lo capture
+            raise
 
-    # Orden correcto: (activity, auth_header, callback)
-    await adapter.process_activity(activity, auth_header, aux_func)
+    # Orden correcto (auth_header, activity, callback)
+    await adapter.process_activity(auth_header, activity, aux_func)
     return web.Response(status=201)
+
 
 async def health(_: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
-async def diag_env(_: web.Request) -> web.Response:
-    return web.json_response(public_env_snapshot())
 
+async def diag_env(_: web.Request) -> web.Response:
+    snap = public_env_snapshot()
+    return web.json_response(snap)
+
+
+# --- Diagnóstico de token con MSAL (para validar credenciales AAD) ---
 TENANT = _env("MICROSOFT_APP_TENANT_ID") or "organizations"
-AUTHORITY_ORG = f"https://login.microsoftonline.com/{TENANT}"
-AUTHORITY_BF  = "https://login.microsoftonline.com/botframework.com"
+AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT}"
+AUTH_BF = "https://login.microsoftonline.com/botframework.com"
 SCOPE = ["https://api.botframework.com/.default"]
 
-def _try_token(authority: str) -> dict:
-    appc = msal.ConfidentialClientApplication(
-        client_id=APP_ID,
-        client_credential=APP_PASSWORD,
-        authority=authority,
-    )
-    token = appc.acquire_token_for_client(scopes=SCOPE)
-    ok = "access_token" in token
-    payload = {"ok": ok, "keys": list(token.keys()), "authority": authority}
-    if not ok:
-        payload["error"] = token
-    return payload
 
 async def diag_msal(_: web.Request) -> web.Response:
-    return web.json_response(_try_token(AUTHORITY_ORG), status=200)
+    # Token contra tu tenant (útil para comprobar secreto)
+    log.info("Initializing with Entra authority: %s", AUTH_TENANT)
+    try:
+        appc = msal.ConfidentialClientApplication(
+            client_id=APP_ID,
+            client_credential=APP_PASSWORD,
+            authority=AUTH_TENANT,
+        )
+        token = appc.acquire_token_for_client(scopes=SCOPE)
+        ok = "access_token" in token
+        payload = {"ok": ok, "keys": list(token.keys()), "authority": AUTH_TENANT}
+        if not ok:
+            payload["error"] = token
+        return web.json_response(payload, status=200 if ok else 500)
+    except Exception as e:
+        return web.json_response({"ok": False, "exception": str(e)}, status=500)
+
 
 async def diag_msal_bf(_: web.Request) -> web.Response:
-    return web.json_response(_try_token(AUTHORITY_BF), status=200)
+    # Token contra botframework.com (el que usa el conector saliente)
+    log.info("Initializing with Entra authority: %s", AUTH_BF)
+    try:
+        appc = msal.ConfidentialClientApplication(
+            client_id=APP_ID,
+            client_credential=APP_PASSWORD,
+            authority=AUTH_BF,
+        )
+        token = appc.acquire_token_for_client(scopes=SCOPE)
+        ok = "access_token" in token
+        payload = {"ok": ok, "keys": list(token.keys()), "authority": AUTH_BF}
+        if not ok:
+            payload["error"] = token
+        return web.json_response(payload, status=200 if ok else 500)
+    except Exception as e:
+        return web.json_response({"ok": False, "exception": str(e)}, status=500)
 
+
+# ==========
+# App AIOHTTP
+# ==========
 app = web.Application()
 app.router.add_post("/api/messages", messages)
 app.router.add_get("/health", health)
@@ -140,7 +239,10 @@ app.router.add_get("/diag/env", diag_env)
 app.router.add_get("/diag/msal", diag_msal)
 app.router.add_get("/diag/msal-bf", diag_msal_bf)
 
+
+# ==========
+# Main
+# ==========
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    log.info("Starting on :%s", port)
     web.run_app(app, host="0.0.0.0", port=port)
