@@ -1,16 +1,22 @@
 # app.py — Teams Gateway (aiohttp + CloudAdapter, SDK 4.14.x)
 
-import json
 import logging
 import os
 from aiohttp import web
 
-from botbuilder.core import CloudAdapter, TurnContext
+from botbuilder.core import TurnContext
 from botbuilder.schema import Activity
-from botframework.connector.auth import (
+from botframework.connector.auth import MicrosoftAppCredentials
+
+# ✅ IMPORTS CORRECTOS para CloudAdapter y Auth (paquete integration.aiohttp)
+from botbuilder.integration.aiohttp import CloudAdapter
+from botbuilder.integration.aiohttp.configuration_bot_framework_authentication import (
     ConfigurationBotFrameworkAuthentication,
+)
+from botbuilder.integration.aiohttp.configuration_service_client_credential_factory import (
     ConfigurationServiceClientCredentialFactory,
 )
+
 import msal
 
 # ----------------------
@@ -18,8 +24,9 @@ import msal
 # ----------------------
 from bot import DataTalkBot
 
+
 # ----------------------
-# Logging básico
+# Logging
 # ----------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -27,82 +34,63 @@ logging.basicConfig(
 )
 log = logging.getLogger("teams-gateway")
 
+
 # =========================
-# Helpers de configuración
+# Helpers de entorno
 # =========================
-_CAMEL_BY_UPPER = {
-    "MICROSOFT_APP_ID": "MicrosoftAppId",
-    "MICROSOFT_APP_PASSWORD": "MicrosoftAppPassword",
-    "MICROSOFT_APP_TENANT_ID": "MicrosoftAppTenantId",
-    "MICROSOFT_APP_TYPE": "MicrosoftAppType",
-    "TOCHANNELFROMBOTOAUTHSCOPE": "ToChannelFromBotOAuthScope",
-    "TOCHANNELFROMBOTOAUTHSCOPE": "ToChannelFromBotOAuthScope",
-}
-
-def _env(name: str, fallback: str = "") -> str:
+def resolve_env_preferring_camel(camel_key: str, upper_key: str, default: str = "") -> str:
     """
-    Lee primero MAYÚSCULAS; si no existe, intenta camelCase (compat Render).
+    Toma primero CAMELCASE; si falta, usa MAYÚSCULAS; y siempre fija CAMELCASE en os.environ
+    para que el adapter las encuentre sin ambigüedad.
     """
-    if name in os.environ and os.environ.get(name):
-        return os.environ.get(name, fallback)
-    # compat: aceptar camelCase si el upper no está
-    alt = _CAMEL_BY_UPPER.get(name, "")
-    if alt and os.environ.get(alt):
-        return os.environ.get(alt, fallback)
-    return fallback
+    val = os.getenv(camel_key)
+    if not val:
+        val = os.getenv(upper_key, default)
+        if val:
+            os.environ[camel_key] = val
+    return os.getenv(camel_key, default)
 
 
-def public_env_snapshot() -> dict:
-    """
-    Muestra si variables críticas están SET/MISSING (sin valores).
-    Útil para /diag/env.
-    """
-    keys = [
-        "MICROSOFT_APP_ID",
-        "MICROSOFT_APP_PASSWORD",
-        "MICROSOFT_APP_TENANT_ID",
-        "MICROSOFT_APP_TYPE",
-        "MicrosoftAppId",
-        "MicrosoftAppPassword",
-        "MicrosoftAppTenantId",
-        "MicrosoftAppType",
-        "ToChannelFromBotOAuthScope",
-        "PORT",
-    ]
-    out = {}
-    for k in keys:
-        v = os.getenv(k)
-        out[k] = "SET(***masked***)" if v else "MISSING"
-    # por conveniencia, qué AppId estamos usando efectivamente
-    out["EFFECTIVE_APP_ID"] = _env("MICROSOFT_APP_ID") or _env("MicrosoftAppId") or ""
-    return out
+def enforce_defaults():
+    # Scope hacia el Connector (con .default)
+    os.environ.setdefault("ToChannelFromBotOAuthScope", "https://api.botframework.com/.default")
+    # Recomendación para pruebas (puedes dejar SingleTenant si así es tu app)
+    os.environ.setdefault("MicrosoftAppType", os.getenv("MicrosoftAppType", "MultiTenant"))
 
 
-# =====================================
-# Credenciales (AppId / Password AAD)
-# =====================================
-APP_ID = _env("MICROSOFT_APP_ID")
-APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD")
-APP_TYPE = _env("MICROSOFT_APP_TYPE", "MultiTenant")  # si tu bot es single-tenant, usa "SingleTenant"
-TENANT_ID = _env("MICROSOFT_APP_TENANT_ID") or None
-OAUTH_SCOPE = os.getenv("ToChannelFromBotOAuthScope", "https://api.botframework.com")
+APP_ID = resolve_env_preferring_camel("MicrosoftAppId", "MICROSOFT_APP_ID")
+APP_PASSWORD = resolve_env_preferring_camel("MicrosoftAppPassword", "MICROSOFT_APP_PASSWORD")
+TENANT_ID = resolve_env_preferring_camel("MicrosoftAppTenantId", "MICROSOFT_APP_TENANT_ID")
+APP_TYPE = resolve_env_preferring_camel("MicrosoftAppType", "MICROSOFT_APP_TYPE", "MultiTenant")
+enforce_defaults()
 
-# Factory de credenciales explícita (evita que se “pierda” el AppId)
+# ==========================
+# Auth + Adapter (CloudAdapter)
+# ==========================
+# Pasamos una cred factory explícita con tu AppId/Password (evita ambigüedades).
 cred_factory = ConfigurationServiceClientCredentialFactory(
-    app_id=APP_ID or None,
-    password=APP_PASSWORD or None,
-    tenant_id=TENANT_ID,
-    app_type=APP_TYPE,
+    {
+        "MicrosoftAppId": APP_ID,
+        "MicrosoftAppPassword": APP_PASSWORD,
+        # Si usas SingleTenant, también ayuda tener tenant:
+        "MicrosoftAppTenantId": TENANT_ID,
+        "MicrosoftAppType": APP_TYPE,
+    }
 )
 
-# ConfigurationBotFrameworkAuthentication requiere 'configuration' posicional; pasamos {}.
-auth = ConfigurationBotFrameworkAuthentication(configuration={}, credentials_factory=cred_factory)
+# La "configuration" es solo algo con .get(); usamos un wrapper simple sobre os.environ
+class EnvConfiguration:
+    def __init__(self, env): self._env = env
+    def get(self, key: str, default=None): return self._env.get(key, default)
 
-# Adapter moderno
+config = EnvConfiguration(os.environ)
+
+auth = ConfigurationBotFrameworkAuthentication(configuration=config, credentials_factory=cred_factory)
 adapter = CloudAdapter(auth)
 
-# Instancia del bot
+# Tu bot
 bot = DataTalkBot()
+
 
 # ==========================
 # Manejo global de errores
@@ -116,41 +104,47 @@ async def on_error(context: TurnContext, error: Exception):
 
 adapter.on_turn_error = on_error
 
+
 # ==========
 # Handlers
 # ==========
 async def messages(req: web.Request) -> web.Response:
-    # Requerimos application/json (admitimos charset)
-    ctype = req.headers.get("Content-Type", "")
-    if "application/json" not in ctype:
+    if "application/json" not in (req.headers.get("Content-Type") or ""):
         return web.Response(status=415, text="Content-Type must be application/json")
 
     body = await req.json()
     activity: Activity = Activity().deserialize(body)
     auth_header = req.headers.get("Authorization", "")
 
-    # ---- Diagnóstico útil en cada llegada ----
+    # Diagnóstico útil
     recipient_raw = getattr(activity.recipient, "id", "")
     channel_id = getattr(activity, "channel_id", "")
     service_url = getattr(activity, "service_url", "")
 
     normalized = recipient_raw
-    if channel_id == "msteams" and recipient_raw.startswith("28:"):
+    if channel_id == "msteams" and isinstance(recipient_raw, str) and recipient_raw.startswith("28:"):
         normalized = recipient_raw.split("28:")[-1]
 
     log.info(
         "[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | channel=%s | serviceUrl=%s",
-        APP_ID, recipient_raw, channel_id, service_url,
+        APP_ID or "(empty)", recipient_raw, channel_id, service_url,
     )
     if channel_id == "msteams":
         log.info("[DIAG][msteams] normalized=%s", normalized)
-    if APP_ID and normalized and normalized != APP_ID:
-        log.error("[MISMATCH] Mensaje para botId=%s, pero proceso firma como=%s. Revisa AppId/secret/manifest.", normalized, APP_ID)
+
+    if normalized and APP_ID and normalized != APP_ID:
+        log.error("[MISMATCH] Mensaje para botId=%s, pero proceso firma como=%s.", normalized, APP_ID)
+
+    # Confiar serviceUrl por si el Connector lo requiere
+    try:
+        MicrosoftAppCredentials.trust_service_url(service_url)
+    except Exception as e:
+        log.warning("No se pudo registrar trust_service_url(%s): %s", service_url, e)
 
     async def aux(turn_context: TurnContext):
         await bot.on_turn(turn_context)
 
-    # CloudAdapter valida el JWT y luego ejecuta el callback
+    # CloudAdapter: (auth_header, activity, callback)
     await adapter.process_activity(auth_header, activity, aux)
     return web.Response(status=201)
 
@@ -159,11 +153,26 @@ async def health(_: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+def public_env_snapshot() -> dict:
+    keys = [
+        # camelCase que DEBE usar el adapter
+        "MicrosoftAppId", "MicrosoftAppPassword", "MicrosoftAppTenantId",
+        "MicrosoftAppType", "ToChannelFromBotOAuthScope", "PORT",
+        # para detectar residuos en MAYÚSCULAS
+        "MICROSOFT_APP_ID", "MICROSOFT_APP_PASSWORD", "MICROSOFT_APP_TENANT_ID", "MICROSOFT_APP_TYPE",
+    ]
+    out = {}
+    for k in keys:
+        out[k] = "SET(***masked***)" if os.getenv(k) else "MISSING"
+    out["EFFECTIVE_APP_ID"] = APP_ID or "(empty)"
+    return out
+
+
 async def diag_env(_: web.Request) -> web.Response:
     return web.json_response(public_env_snapshot())
 
 
-# --- Diagnóstico de token con MSAL (para validar secreto/permiso) ---
+# --- Diagnóstico de token con MSAL (para validar secreto AAD) ---
 TENANT_FOR_TEST = TENANT_ID or "organizations"
 AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT_FOR_TEST}"
 AUTH_BF = "https://login.microsoftonline.com/botframework.com"
@@ -173,7 +182,9 @@ async def diag_msal(_: web.Request) -> web.Response:
     log.info("Initializing with Entra authority: %s", AUTH_TENANT)
     try:
         appc = msal.ConfidentialClientApplication(
-            client_id=APP_ID, client_credential=APP_PASSWORD, authority=AUTH_TENANT
+            client_id=APP_ID or "",
+            client_credential=APP_PASSWORD or "",
+            authority=AUTH_TENANT,
         )
         token = appc.acquire_token_for_client(scopes=SCOPE)
         ok = "access_token" in token
@@ -188,7 +199,9 @@ async def diag_msal_bf(_: web.Request) -> web.Response:
     log.info("Initializing with Entra authority: %s", AUTH_BF)
     try:
         appc = msal.ConfidentialClientApplication(
-            client_id=APP_ID, client_credential=APP_PASSWORD, authority=AUTH_BF
+            client_id=APP_ID or "",
+            client_credential=APP_PASSWORD or "",
+            authority=AUTH_BF,
         )
         token = appc.acquire_token_for_client(scopes=SCOPE)
         ok = "access_token" in token
@@ -199,23 +212,6 @@ async def diag_msal_bf(_: web.Request) -> web.Response:
     except Exception as e:
         return web.json_response({"ok": False, "exception": str(e)}, status=500)
 
-# --- Diagnóstico crítico: qué AppId ve el adapter y si lo valida ---
-async def diag_authcfg(_: web.Request) -> web.Response:
-    try:
-        is_valid = await cred_factory.is_valid_app_id(APP_ID or "")
-    except Exception as e:
-        is_valid = False
-        log.error("cred_factory.is_valid_app_id() lanzó: %s", e, exc_info=True)
-
-    payload = {
-        "app_id_env": APP_ID or "",
-        "app_id_factory": getattr(cred_factory, "app_id", None),
-        "tenant_id_factory": getattr(cred_factory, "tenant_id", None),
-        "app_type": APP_TYPE,
-        "oauth_scope": OAUTH_SCOPE,
-        "factory_considers_appid_valid": is_valid,
-    }
-    return web.json_response(payload)
 
 # ==========
 # App AIOHTTP
@@ -226,7 +222,6 @@ app.router.add_get("/health", health)
 app.router.add_get("/diag/env", diag_env)
 app.router.add_get("/diag/msal", diag_msal)
 app.router.add_get("/diag/msal-bf", diag_msal_bf)
-app.router.add_get("/diag/authcfg", diag_authcfg)
 
 # ==========
 # Main
