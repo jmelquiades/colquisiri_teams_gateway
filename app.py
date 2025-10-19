@@ -85,18 +85,28 @@ adapter.on_turn_error = on_error
 # ==========
 async def messages(req: web.Request) -> web.Response:
     # Acepta "application/json" y variantes con charset
-    if "application/json" not in req.headers.get("Content-Type", ""):
+    if "application/json" not in (req.headers.get("Content-Type") or ""):
         return web.Response(status=415, text="Content-Type must be application/json")
 
-    body = await req.json()
+    try:
+        body = await req.json()
+    except Exception:
+        return web.Response(status=400, text="Invalid JSON body")
+
     activity = Activity().deserialize(body)
+
+    # Validación básica del Activity
+    if not getattr(activity, "type", None):
+        return web.Response(status=400, text="Invalid activity payload: missing type")
+
     auth_header = req.headers.get("Authorization", "")
 
     async def aux_func(turn_context: TurnContext):
         await bot.on_turn(turn_context)
 
-    # MUY IMPORTANTE: orden correcto (auth_header, activity, callback)
-    await adapter.process_activity(auth_header, activity, aux_func)
+    # ORDEN CORRECTO para BotFrameworkAdapter (SDK 4.14.x):
+    # activity, auth_header, callback
+    await adapter.process_activity(activity, auth_header, aux_func)
     return web.Response(status=201)
 
 
@@ -125,7 +135,7 @@ async def diag_msal(_: web.Request) -> web.Response:
         ok = "access_token" in token
         payload = {"ok": ok, "keys": list(token.keys())}
         if not ok:
-            payload["error"] = token  # verás unauthorized_client/invalid_client, etc.
+            payload["error"] = token  # unauthorized_client / invalid_client, etc.
         return web.json_response(payload, status=200 if ok else 500)
     except Exception as e:
         return web.json_response({"ok": False, "exception": str(e)}, status=500)
