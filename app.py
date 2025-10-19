@@ -1,5 +1,5 @@
 # app.py — Teams Gateway (aiohttp + BotFrameworkAdapter, SDK 4.14.x)
-# Bridge de variables + diagnósticos de token (organizations y botframework.com)
+# Añade diagnóstico de AppId/recipientId para detectar 401 por credenciales cruzadas.
 
 import os
 import logging
@@ -9,11 +9,9 @@ from botbuilder.schema import Activity
 import msal
 from bot import DataTalkBot
 
-# ========== Logging básico ==========
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("teams-gateway")
 
-# ========== Helpers ==========
 def _env(name: str, fallback: str = "") -> str:
     return os.getenv(
         name,
@@ -49,38 +47,46 @@ def public_env_snapshot() -> dict:
 
 bridge_env_vars()
 
-# ========== Credenciales ==========
 APP_ID = _env("MICROSOFT_APP_ID", "")
 APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
 
 adapter = BotFrameworkAdapter(BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD))
 bot = DataTalkBot()
 
-# ========== Error global ==========
 async def on_error(context: TurnContext, error: Exception):
     log.error("[BOT ERROR] %s", error, exc_info=True)
     try:
-        await context.send_activity(
-            "Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo."
-        )
+        await context.send_activity("Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo.")
     except Exception as e:
         log.error("[BOT ERROR][send_activity] %s", e, exc_info=True)
 
 adapter.on_turn_error = on_error
 
-# ========== Handlers ==========
 async def messages(req: web.Request) -> web.Response:
     if "application/json" not in req.headers.get("Content-Type", ""):
         return web.Response(status=415, text="Content-Type must be application/json")
 
     body = await req.json()
-    activity = Activity().deserialize(body)
+    activity: Activity = Activity().deserialize(body)
     auth_header = req.headers.get("Authorization", "")
+
+    # === DIAGNÓSTICO CLAVE ===
+    # recipient.id = AppId del bot para el cual va dirigido el mensaje
+    rec_id = getattr(activity.recipient, "id", None)
+    svc_url = getattr(activity, "service_url", None)
+    chan_id = getattr(activity, "channel_id", None)
+    log.info("[DIAG] Our APP_ID=%s | activity.recipient.id=%s | channel=%s | serviceUrl=%s",
+             APP_ID, rec_id, chan_id, svc_url)
+
+    # Si no coincide, casi seguro 401 al responder:
+    if rec_id and APP_ID and rec_id != APP_ID:
+        log.error("[MISMATCH] Mensaje dirigido a bot %s, pero este proceso firma como %s. Revisa AppId/secreto.",
+                  rec_id, APP_ID)
 
     async def aux_func(turn_context: TurnContext):
         await bot.on_turn(turn_context)
 
-    # Orden correcto: (activity, auth_header, callback)
+    # Orden: (activity, auth_header, callback)
     await adapter.process_activity(activity, auth_header, aux_func)
     return web.Response(status=201)
 
@@ -88,10 +94,8 @@ async def health(_: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 async def diag_env(_: web.Request) -> web.Response:
-    snap = public_env_snapshot()
-    return web.json_response(snap)
+    return web.json_response(public_env_snapshot())
 
-# ===== Diagnósticos de token =====
 TENANT = _env("MICROSOFT_APP_TENANT_ID") or "organizations"
 AUTHORITY_ORG = f"https://login.microsoftonline.com/{TENANT}"
 AUTHORITY_BF  = "https://login.microsoftonline.com/botframework.com"
@@ -114,18 +118,15 @@ async def diag_msal(_: web.Request) -> web.Response:
     return web.json_response(_try_token(AUTHORITY_ORG), status=200)
 
 async def diag_msal_bf(_: web.Request) -> web.Response:
-    # Este DEBE dar ok=True para que el SDK pueda responder a Teams
     return web.json_response(_try_token(AUTHORITY_BF), status=200)
 
-# ========== App ==========
 app = web.Application()
 app.router.add_post("/api/messages", messages)
 app.router.add_get("/health", health)
 app.router.add_get("/diag/env", diag_env)
-app.router.add_get("/diag/msal", diag_msal)        # organizations / tu tenant
-app.router.add_get("/diag/msal-bf", diag_msal_bf)  # botframework.com  ⬅️ clave
+app.router.add_get("/diag/msal", diag_msal)
+app.router.add_get("/diag/msal-bf", diag_msal_bf)
 
-# ========== Main ==========
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     log.info("Starting on :%s", port)
