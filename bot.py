@@ -1,6 +1,5 @@
-# bot.py — Bot mínimo para validar auth (responde un eco)
+# bot.py — Bot mínimo (eco) para validar auth
 from botbuilder.core import ActivityHandler, TurnContext, MessageFactory
-
 
 class DataTalkBot(ActivityHandler):
     async def on_message_activity(self, turn_context: TurnContext):
