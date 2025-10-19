@@ -4,15 +4,16 @@ import logging
 import os
 from aiohttp import web
 
-from botbuilder.core import TurnContext
+from botbuilder.core import (
+    TurnContext,
+    Configuration,
+    ConfigurationBotFrameworkAuthentication,
+)
 from botbuilder.schema import Activity
 from botframework.connector.auth import MicrosoftAppCredentials
 
-# IMPORTS CORRECTOS PARA CLOUDADAPTER (aiohttp)
+# CloudAdapter para aiohttp
 from botbuilder.integration.aiohttp import CloudAdapter
-from botbuilder.integration.aiohttp.configuration_bot_framework_authentication import (
-    ConfigurationBotFrameworkAuthentication,
-)
 
 import msal
 
@@ -71,7 +72,9 @@ bot = DataTalkBot()
 # ==========================
 # Adapter (CloudAdapter) + Auth
 # ==========================
-auth = ConfigurationBotFrameworkAuthentication()  # lee MicrosoftAppId/Password, etc. desde ENV
+# En 4.14.x, ConfigurationBotFrameworkAuthentication requiere un Configuration
+config = Configuration(os.environ)
+auth = ConfigurationBotFrameworkAuthentication(config)
 adapter = CloudAdapter(auth)
 
 
