@@ -1,4 +1,4 @@
-# app.py — Teams Gateway (aiohttp + BotFrameworkAdapter, SDK 4.14.x)
+# app.py — Teams Gateway (aiohttp + CloudAdapter, SDK 4.14.x)
 
 import json
 import logging
@@ -7,19 +7,19 @@ from aiohttp import web
 
 from botbuilder.core import (
     TurnContext,
-    BotFrameworkAdapter,
-    BotFrameworkAdapterSettings,
+    CloudAdapter,
+)
+from botbuilder.core.auth import (
+    ConfigurationBotFrameworkAuthentication,
 )
 from botbuilder.schema import Activity
 from botframework.connector.auth import MicrosoftAppCredentials
-
 import msal
 
 # ----------------------
 # Tu bot (debe tener .on_turn)
 # ----------------------
 from bot import DataTalkBot
-
 
 # ----------------------
 # Logging básico
@@ -35,74 +35,57 @@ log = logging.getLogger("teams-gateway")
 # Helpers de configuración
 # =========================
 def _env(name: str, fallback: str = "") -> str:
-    """
-    Lee primero MAYÚSCULAS; si no existe, intenta camelCase (por compatibilidad
-    con variables ya creadas en Render). Si no, usa fallback.
-    """
-    return os.getenv(
-        name,
-        os.getenv(
-            {
-                "MICROSOFT_APP_ID": "MicrosoftAppId",
-                "MICROSOFT_APP_PASSWORD": "MicrosoftAppPassword",
-                "MICROSOFT_APP_TENANT_ID": "MicrosoftAppTenantId",
-                "MICROSOFT_APP_TYPE": "MicrosoftAppType",
-            }.get(name, ""),
-            fallback,
-        ),
-    )
+    return os.getenv(name, fallback)
 
-
-def public_env_snapshot() -> dict:
+def _propagate_env_aliases():
     """
-    Snapshot seguro del entorno: indica si existen variables críticas
-    sin revelar sus valores. Útil para /diag/env.
+    CloudAdapter lee por defecto las variables en camelCase a través de
+    ConfigurationBotFrameworkAuthentication. Si solo configuras MAYÚSCULAS
+    en Render, aquí las copiamos como alias para evitar confusiones.
     """
-    keys = [
-        "MICROSOFT_APP_ID",
-        "MICROSOFT_APP_PASSWORD",
-        "MICROSOFT_APP_TENANT_ID",
-        "MICROSOFT_APP_TYPE",
-        "MicrosoftAppId",
-        "MicrosoftAppPassword",
-        "MicrosoftAppTenantId",
-        "MicrosoftAppType",
-        "PORT",
+    aliases = [
+        ("MICROSOFT_APP_ID", "MicrosoftAppId"),
+        ("MICROSOFT_APP_PASSWORD", "MicrosoftAppPassword"),
+        ("MICROSOFT_APP_TYPE", "MicrosoftAppType"),
+        ("MICROSOFT_APP_TENANT_ID", "MicrosoftAppTenantId"),
     ]
-    out = {}
-    for k in keys:
-        v = _env(k)
-        out[k] = "SET(***masked***)" if v else "MISSING"
-    return out
+    for upper, camel in aliases:
+        v = os.getenv(upper)
+        if v and not os.getenv(camel):
+            os.environ[camel] = v
 
+    # Scope correcto hacia el Connector
+    if not os.getenv("ToChannelFromBotOAuthScope"):
+        os.environ["ToChannelFromBotOAuthScope"] = "https://api.botframework.com/.default"
 
-# =====================================
-# Credenciales (AppId / Password AAD)
-# =====================================
-APP_ID = _env("MICROSOFT_APP_ID", "")
-APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
+    # Si no definiste el tipo, forzamos MultiTenant (recomendado para Teams)
+    if not os.getenv("MicrosoftAppType"):
+        os.environ["MicrosoftAppType"] = "MultiTenant"
 
-# Adapter clásico (estable con SDK 4.14.x)
-adapter = BotFrameworkAdapter(BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD))
+_prop_or = _propagate_env_aliases  # alias corto
+_prop_or()
 
+APP_ID = os.getenv("MicrosoftAppId") or os.getenv("MICROSOFT_APP_ID", "")
 # Instancia del bot
 bot = DataTalkBot()
 
+# ==========================
+# Adapter (CloudAdapter) + Auth
+# ==========================
+auth = ConfigurationBotFrameworkAuthentication()  # lee las env ya propagadas
+adapter = CloudAdapter(auth)
 
 # ==========================
 # Manejo global de errores
 # ==========================
 async def on_error(context: TurnContext, error: Exception):
-    # Si el SDK lanzó ErrorResponseException, intentamos sacar cuerpo
     log.error("[BOT ERROR] %s", error, exc_info=True)
-
     try:
         await context.send_activity(
             "Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo."
         )
     except Exception as e:
         log.error("[BOT ERROR][send_activity] %s", e, exc_info=True)
-
 
 adapter.on_turn_error = on_error
 
@@ -126,7 +109,7 @@ async def messages(req: web.Request) -> web.Response:
 
     # Normalización para Teams: en Teams el recipient suele ser "28:{appId}"
     normalized = recipient_raw
-    if channel_id == "msteams" and recipient_raw.startswith("28:"):
+    if channel_id == "msteams" and isinstance(recipient_raw, str) and recipient_raw.startswith("28:"):
         normalized = recipient_raw.split("28:")[-1]
 
     log.info(
@@ -140,64 +123,67 @@ async def messages(req: web.Request) -> web.Response:
         log.info("[DIAG][msteams] normalized=%s", normalized)
 
     # Comprobación de mismatch (evita que un bot se intente usar con otro AppId)
-    if channel_id in ("msteams", "skype"):
-        target = normalized
-    else:
-        target = recipient_raw  # p.ej. webchat usa un botId diferente (hash)
-
+    target = normalized if channel_id in ("msteams", "skype") else recipient_raw
     if target and APP_ID and target != APP_ID:
         log.error(
             "[MISMATCH] Mensaje para botId=%s, pero proceso firma como=%s. Revisa AppId/secret/manifest.",
             target,
             APP_ID,
         )
-        # Aun así seguimos el turno para poder ver el 401 con detalle
-        # (no devolvemos 401 aquí para no cortar telemetría)
 
-    # MUY IMPORTANTE: confiar en el serviceUrl antes de enviar respuestas
-    # (algunos endpoints de Teams/WebChat requieren trust explícito)
+    # Cinturón y tirantes: confiar serviceUrl antes de enviar
     try:
         MicrosoftAppCredentials.trust_service_url(service_url)
     except Exception as e:
         log.warning("No se pudo registrar trust_service_url(%s): %s", service_url, e)
 
     async def aux_func(turn_context: TurnContext):
-        try:
-            await bot.on_turn(turn_context)
-        except Exception as ex:
-            # Si el bot falla enviando (401), lo verás con stack + contenido abajo
-            log.error("[BOT ERROR] %s", ex, exc_info=True)
-            # Propagamos para que on_error también lo capture
-            raise
+        await bot.on_turn(turn_context)
 
-    # Orden correcto (auth_header, activity, callback)
-    await adapter.process_activity(activity, auth_header, aux_func)
+    # CloudAdapter: (auth_header, activity, callback)
+    await adapter.process_activity(auth_header, activity, aux_func)
     return web.Response(status=201)
-     # Orden correcto (auth_header, activity, callback)
+
 
 async def health(_: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+def public_env_snapshot() -> dict:
+    keys = [
+        "MICROSOFT_APP_ID",
+        "MICROSOFT_APP_PASSWORD",
+        "MICROSOFT_APP_TENANT_ID",
+        "MICROSOFT_APP_TYPE",
+        "MicrosoftAppId",
+        "MicrosoftAppPassword",
+        "MicrosoftAppTenantId",
+        "MicrosoftAppType",
+        "ToChannelFromBotOAuthScope",
+        "PORT",
+    ]
+    out = {}
+    for k in keys:
+        v = os.getenv(k)
+        out[k] = "SET(***masked***)" if v else "MISSING"
+    return out
+
 async def diag_env(_: web.Request) -> web.Response:
-    snap = public_env_snapshot()
-    return web.json_response(snap)
+    return web.json_response(public_env_snapshot())
 
 
 # --- Diagnóstico de token con MSAL (para validar credenciales AAD) ---
-TENANT = _env("MICROSOFT_APP_TENANT_ID") or "organizations"
+TENANT = os.getenv("MICROSOFT_APP_TENANT_ID") or os.getenv("MicrosoftAppTenantId") or "organizations"
 AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT}"
 AUTH_BF = "https://login.microsoftonline.com/botframework.com"
 SCOPE = ["https://api.botframework.com/.default"]
 
-
 async def diag_msal(_: web.Request) -> web.Response:
-    # Token contra tu tenant (útil para comprobar secreto)
     log.info("Initializing with Entra authority: %s", AUTH_TENANT)
     try:
         appc = msal.ConfidentialClientApplication(
             client_id=APP_ID,
-            client_credential=APP_PASSWORD,
+            client_credential=os.getenv("MicrosoftAppPassword") or os.getenv("MICROSOFT_APP_PASSWORD", ""),
             authority=AUTH_TENANT,
         )
         token = appc.acquire_token_for_client(scopes=SCOPE)
@@ -209,14 +195,12 @@ async def diag_msal(_: web.Request) -> web.Response:
     except Exception as e:
         return web.json_response({"ok": False, "exception": str(e)}, status=500)
 
-
 async def diag_msal_bf(_: web.Request) -> web.Response:
-    # Token contra botframework.com (el que usa el conector saliente)
     log.info("Initializing with Entra authority: %s", AUTH_BF)
     try:
         appc = msal.ConfidentialClientApplication(
             client_id=APP_ID,
-            client_credential=APP_PASSWORD,
+            client_credential=os.getenv("MicrosoftAppPassword") or os.getenv("MICROSOFT_APP_PASSWORD", ""),
             authority=AUTH_BF,
         )
         token = appc.acquire_token_for_client(scopes=SCOPE)
