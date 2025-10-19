@@ -1,25 +1,26 @@
 # app.py — Teams Gateway (aiohttp + CloudAdapter, SDK 4.14.x)
 
-import json
 import logging
 import os
 from aiohttp import web
 
-from botbuilder.core import (
-    TurnContext,
-    CloudAdapter,
-)
-from botbuilder.core.auth import (
-    ConfigurationBotFrameworkAuthentication,
-)
+from botbuilder.core import TurnContext
 from botbuilder.schema import Activity
 from botframework.connector.auth import MicrosoftAppCredentials
+
+# IMPORTS CORRECTOS PARA CLOUDADAPTER (aiohttp)
+from botbuilder.integration.aiohttp import CloudAdapter
+from botbuilder.integration.aiohttp.configuration_bot_framework_authentication import (
+    ConfigurationBotFrameworkAuthentication,
+)
+
 import msal
 
 # ----------------------
 # Tu bot (debe tener .on_turn)
 # ----------------------
 from bot import DataTalkBot
+
 
 # ----------------------
 # Logging básico
@@ -34,20 +35,17 @@ log = logging.getLogger("teams-gateway")
 # =========================
 # Helpers de configuración
 # =========================
-def _env(name: str, fallback: str = "") -> str:
-    return os.getenv(name, fallback)
-
 def _propagate_env_aliases():
     """
-    CloudAdapter lee por defecto las variables en camelCase a través de
-    ConfigurationBotFrameworkAuthentication. Si solo configuras MAYÚSCULAS
-    en Render, aquí las copiamos como alias para evitar confusiones.
+    CloudAdapter (ConfigurationBotFrameworkAuthentication) busca por defecto
+    variables camelCase. Si solo configuras MAYÚSCULAS en Render, aquí las
+    copiamos como alias para evitar confusiones.
     """
     aliases = [
         ("MICROSOFT_APP_ID", "MicrosoftAppId"),
         ("MICROSOFT_APP_PASSWORD", "MicrosoftAppPassword"),
-        ("MICROSOFT_APP_TYPE", "MicrosoftAppType"),
         ("MICROSOFT_APP_TENANT_ID", "MicrosoftAppTenantId"),
+        ("MICROSOFT_APP_TYPE", "MicrosoftAppType"),
     ]
     for upper, camel in aliases:
         v = os.getenv(upper)
@@ -62,18 +60,20 @@ def _propagate_env_aliases():
     if not os.getenv("MicrosoftAppType"):
         os.environ["MicrosoftAppType"] = "MultiTenant"
 
-_prop_or = _propagate_env_aliases  # alias corto
-_prop_or()
+
+_propagate_env_aliases()
 
 APP_ID = os.getenv("MicrosoftAppId") or os.getenv("MICROSOFT_APP_ID", "")
+
 # Instancia del bot
 bot = DataTalkBot()
 
 # ==========================
 # Adapter (CloudAdapter) + Auth
 # ==========================
-auth = ConfigurationBotFrameworkAuthentication()  # lee las env ya propagadas
+auth = ConfigurationBotFrameworkAuthentication()  # lee MicrosoftAppId/Password, etc. desde ENV
 adapter = CloudAdapter(auth)
+
 
 # ==========================
 # Manejo global de errores
@@ -87,6 +87,7 @@ async def on_error(context: TurnContext, error: Exception):
     except Exception as e:
         log.error("[BOT ERROR][send_activity] %s", e, exc_info=True)
 
+
 adapter.on_turn_error = on_error
 
 
@@ -95,7 +96,7 @@ adapter.on_turn_error = on_error
 # ==========
 async def messages(req: web.Request) -> web.Response:
     # Acepta "application/json" y variantes con charset
-    if "application/json" not in req.headers.get("Content-Type", ""):
+    if "application/json" not in (req.headers.get("Content-Type") or ""):
         return web.Response(status=415, text="Content-Type must be application/json")
 
     body = await req.json()
@@ -168,6 +169,7 @@ def public_env_snapshot() -> dict:
         out[k] = "SET(***masked***)" if v else "MISSING"
     return out
 
+
 async def diag_env(_: web.Request) -> web.Response:
     return web.json_response(public_env_snapshot())
 
@@ -178,7 +180,9 @@ AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT}"
 AUTH_BF = "https://login.microsoftonline.com/botframework.com"
 SCOPE = ["https://api.botframework.com/.default"]
 
+
 async def diag_msal(_: web.Request) -> web.Response:
+    # Token contra tu tenant (útil para comprobar secreto y expiración)
     log.info("Initializing with Entra authority: %s", AUTH_TENANT)
     try:
         appc = msal.ConfidentialClientApplication(
@@ -195,7 +199,9 @@ async def diag_msal(_: web.Request) -> web.Response:
     except Exception as e:
         return web.json_response({"ok": False, "exception": str(e)}, status=500)
 
+
 async def diag_msal_bf(_: web.Request) -> web.Response:
+    # Token contra botframework.com (el que usa el conector saliente)
     log.info("Initializing with Entra authority: %s", AUTH_BF)
     try:
         appc = msal.ConfidentialClientApplication(
