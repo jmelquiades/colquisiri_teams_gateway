@@ -1,11 +1,6 @@
-aiohttp>=3.10,<3.12
-
-botbuilder-core==4.17.0
-botbuilder-schema==4.17.0
-botbuilder-integration-aiohttp==4.17.0
-
-# Telemetría
-botbuilder-applicationinsights==4.17.0
-
-# Auth cliente
-msal>=1.30
+aiohttp==3.8.5
+msal>=1.28
+botbuilder-core==4.15.0
+botbuilder-schema==4.15.0
+botbuilder-integration-aiohttp==4.15.0
+botframework-connector==4.15.0

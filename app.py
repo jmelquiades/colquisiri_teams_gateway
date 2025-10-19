@@ -1,31 +1,24 @@
-# app.py — Teams Gateway con CloudAdapter (aiohttp, SDK 4.17.x) + Diagnóstico y App Insights
+# app.py — Teams Gateway (aiohttp + CloudAdapter, SDK 4.15.x)
+
 import os
 import json
-import base64
 import logging
+from typing import Optional
+
 from aiohttp import web
 
-from botbuilder.core import TurnContext, MessageFactory, TelemetryLoggerMiddleware
+# --- Bot Framework SDK (4.15.x) ---
+from botbuilder.core import CloudAdapter, TurnContext, MessageFactory
+from botbuilder.integration.aiohttp import ConfigurationBotFrameworkAuthentication
 from botbuilder.schema import Activity
-from botbuilder.integration.aiohttp.cloud_adapter import CloudAdapter
-from botbuilder.integration.aiohttp.configuration_bot_framework_authentication import (
-    ConfigurationBotFrameworkAuthentication,
-)
+from botframework.connector.auth import MicrosoftAppCredentials
 
-# Telemetría (Application Insights)
-# Docs: ApplicationInsightsTelemetryClient + TelemetryLoggerMiddleware
-# https://learn.microsoft.com/python/api/botbuilder-applicationinsights
-from botbuilder.applicationinsights import ApplicationInsightsTelemetryClient, bot_telemetry_processor
-
-import msal
-
-# Tu bot
+# --- Tu bot (debe exponer on_turn / on_message_activity) ---
 from bot import DataTalkBot
 
-
-# ----------------------
-# Logging básico
-# ----------------------
+# =========================
+# Logging
+# =========================
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(levelname)s:%(name)s:%(message)s",
@@ -36,67 +29,71 @@ log = logging.getLogger("teams-gateway")
 # =========================
 # Helpers de configuración
 # =========================
-def _get_env(name: str, fallback: str = "") -> str:
-    # Acepta MAYÚSCULAS y camelCase (compat Render)
-    return os.getenv(name, os.getenv({
+def _env(name: str, fallback: str = "") -> str:
+    """
+    Lee primero MAYÚSCULAS; si no existe, intenta camelCase (compat Render/Azure).
+    """
+    camel_map = {
         "MICROSOFT_APP_ID": "MicrosoftAppId",
         "MICROSOFT_APP_PASSWORD": "MicrosoftAppPassword",
         "MICROSOFT_APP_TENANT_ID": "MicrosoftAppTenantId",
         "MICROSOFT_APP_TYPE": "MicrosoftAppType",
-        "TO_CHANNEL_SCOPE": "ToChannelFromBotOAuthScope",
+        "TO_CHANNEL_FROM_BOT_OAUTH_SCOPE": "ToChannelFromBotOAuthScope",
         "APPLICATIONINSIGHTS_CONNECTION_STRING": "APPLICATIONINSIGHTS_CONNECTION_STRING",
-    }.get(name, ""), fallback))
+    }
+    return os.getenv(name, os.getenv(camel_map.get(name, ""), fallback))
 
 
 def public_env_snapshot() -> dict:
     keys = [
-        "MICROSOFT_APP_ID", "MICROSOFT_APP_PASSWORD", "MICROSOFT_APP_TENANT_ID", "MICROSOFT_APP_TYPE",
-        "MicrosoftAppId", "MicrosoftAppPassword", "MicrosoftAppTenantId", "MicrosoftAppType",
-        "ToChannelFromBotOAuthScope", "APPLICATIONINSIGHTS_CONNECTION_STRING", "PORT",
+        "MICROSOFT_APP_ID",
+        "MICROSOFT_APP_PASSWORD",
+        "MICROSOFT_APP_TENANT_ID",
+        "MICROSOFT_APP_TYPE",
+        "MicrosoftAppId",
+        "MicrosoftAppPassword",
+        "MicrosoftAppTenantId",
+        "MicrosoftAppType",
+        "ToChannelFromBotOAuthScope",
+        "PORT",
     ]
     out = {}
     for k in keys:
-        v = _get_env(k)
+        v = _env(k)
         out[k] = "SET(***masked***)" if v else "MISSING"
-    out["EFFECTIVE_APP_ID"] = _get_env("MICROSOFT_APP_ID")
-    out["EFFECTIVE_TENANT"] = _get_env("MICROSOFT_APP_TENANT_ID")
-    out["EFFECTIVE_APP_TYPE"] = _get_env("MICROSOFT_APP_TYPE", "SingleTenant")
+    out["EFFECTIVE_APP_ID"] = _env("MICROSOFT_APP_ID", "")
+    out["EFFECTIVE_TENANT"] = _env("MICROSOFT_APP_TENANT_ID", "")
+    out["EFFECTIVE_APP_TYPE"] = _env("MICROSOFT_APP_TYPE", "")
     return out
 
 
-# ==========================
-# CloudAdapter + Auth
-# ==========================
-APP_ID = _get_env("MICROSOFT_APP_ID")
-APP_PASSWORD = _get_env("MICROSOFT_APP_PASSWORD")
-APP_TENANT = _get_env("MICROSOFT_APP_TENANT_ID")   # REQUERIDO si SingleTenant
-APP_TYPE = _get_env("MICROSOFT_APP_TYPE", "SingleTenant")
-TO_BF_SCOPE = _get_env("TO_CHANNEL_SCOPE", "https://api.botframework.com/.default")
+# =========================
+# CloudAdapter + Auth (explícito)
+# =========================
+APP_ID = _env("MICROSOFT_APP_ID", "")
+APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
+TENANT_ID = _env("MICROSOFT_APP_TENANT_ID", "")
+APP_TYPE = (_env("MICROSOFT_APP_TYPE", "") or "SingleTenant").strip()
+OAUTH_SCOPE = _env("TO_CHANNEL_FROM_BOT_OAUTH_SCOPE", "") or "https://api.botframework.com"
 
-config = {
-    "MicrosoftAppId": APP_ID,
-    "MicrosoftAppPassword": APP_PASSWORD,
-    "MicrosoftAppTenantId": APP_TENANT,
-    "MicrosoftAppType": APP_TYPE,  # SingleTenant | MultiTenant | UserAssignedMSI
-    "ToChannelFromBotOAuthScope": TO_BF_SCOPE,
-}
+# Construimos un objeto "config" para el auth del SDK que lea de nuestro _env
+class _Cfg(dict):
+    def get(self, key: str, default: Optional[str] = None):  # SDK lo usa
+        m = {
+            "MicrosoftAppId": APP_ID,
+            "MicrosoftAppPassword": APP_PASSWORD,
+            "MicrosoftAppType": APP_TYPE,
+            "MicrosoftAppTenantId": TENANT_ID,
+            "ToChannelFromBotOAuthScope": OAUTH_SCOPE,
+        }
+        return m.get(key, default)
 
-auth = ConfigurationBotFrameworkAuthentication(configuration=config)
+CONFIG = _Cfg()
+auth = ConfigurationBotFrameworkAuthentication(CONFIG)  # lee del _Cfg, no del env del proceso
 adapter = CloudAdapter(auth)
-bot = DataTalkBot()
 
-# ==========
-# Telemetría opcional a App Insights
-# ==========
-AI_CONN = _get_env("APPLICATIONINSIGHTS_CONNECTION_STRING")
-if AI_CONN:
-    try:
-        ai_client = ApplicationInsightsTelemetryClient(connection_string=AI_CONN, telemetry_processor=bot_telemetry_processor)
-        # Loguea actividades entrantes/salientes sin PII
-        adapter.use(TelemetryLoggerMiddleware(ai_client, log_personal_information=False))
-        log.info("[AI] Application Insights habilitado")
-    except Exception as e:
-        log.warning("[AI] No se pudo inicializar App Insights: %s", e)
+# Instancia del bot
+bot = DataTalkBot()
 
 
 # ==========================
@@ -105,16 +102,16 @@ if AI_CONN:
 async def on_error(context: TurnContext, error: Exception):
     log.error("[BOT ERROR] %s", error, exc_info=True)
     try:
-        await context.send_activity("Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo.")
+        await context.send_activity("Ocurrió un error procesando tu mensaje.")
     except Exception as e:
         log.error("[BOT ERROR][send_activity] %s", e, exc_info=True)
 
 adapter.on_turn_error = on_error
 
 
-# ==========
-# Handlers
-# ==========
+# ==========================
+# Handlers HTTP (aiohttp)
+# ==========================
 async def messages(req: web.Request) -> web.Response:
     if "application/json" not in req.headers.get("Content-Type", ""):
         return web.Response(status=415, text="Content-Type must be application/json")
@@ -123,41 +120,29 @@ async def messages(req: web.Request) -> web.Response:
     activity: Activity = Activity().deserialize(body)
     auth_header = req.headers.get("Authorization", "")
 
-    # ---- Diagnóstico útil
-    recipient_raw = getattr(activity.recipient, "id", "")
+    # Diagnóstico mínimo de entrada
+    rec_raw = getattr(activity.recipient, "id", "")
     channel_id = getattr(activity, "channel_id", "")
     service_url = getattr(activity, "service_url", "")
+    normalized = rec_raw.split("28:")[-1] if channel_id == "msteams" and rec_raw.startswith("28:") else rec_raw
 
-    normalized = recipient_raw
-    if channel_id == "msteams" and recipient_raw.startswith("28:"):
-        normalized = recipient_raw.split("28:")[-1]
-
-    log.info("[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | channel=%s | serviceUrl=%s",
-             APP_ID, recipient_raw, channel_id, service_url)
+    log.info(
+        "[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | channel=%s | serviceUrl=%s",
+        APP_ID, rec_raw, channel_id, service_url
+    )
     if channel_id == "msteams":
         log.info("[DIAG][msteams] normalized=%s", normalized)
 
-    # ---- Dump mínimo de claims del JWT entrante
-    if auth_header.startswith("Bearer "):
-        try:
-            token = auth_header.split(" ", 1)[1]
-            parts = token.split(".")
-            if len(parts) == 3:
-                padded = parts[1] + "=="
-                payload = json.loads(base64.urlsafe_b64decode(padded.encode("utf-8")))
-                iss = payload.get("iss")
-                aud = payload.get("aud")
-                appid_claim = payload.get("appid") or payload.get("azp")
-                tid = payload.get("tid")
-                ver = payload.get("ver")
-                log.info("[JWT] iss=%s | aud=%s | appid=%s | tid=%s | ver=%s", iss, aud, appid_claim, tid, ver)
-        except Exception as e:
-            log.warning("[JWT] No se pudieron decodificar claims: %s", e)
+    # Confiar en el serviceUrl antes de responder (Teams exige esto)
+    try:
+        MicrosoftAppCredentials.trust_service_url(service_url)
+    except Exception as e:
+        log.warning("trust_service_url(%s) falló: %s", service_url, e)
 
     async def aux(turn_context: TurnContext):
         await bot.on_turn(turn_context)
 
-    # Orden CloudAdapter: (auth_header, activity, callback)
+    # Orden correcto (auth_header, activity, callback)
     await adapter.process_activity(auth_header, activity, aux)
     return web.Response(status=201)
 
@@ -170,67 +155,48 @@ async def diag_env(_: web.Request) -> web.Response:
     return web.json_response(public_env_snapshot())
 
 
-# --- Diagnóstico de token MSAL (para validar secreto) ---
-SCOPE = ["https://api.botframework.com/.default"]
-TENANT_FOR_TEST = _get_env("MICROSOFT_APP_TENANT_ID") or "organizations"
-AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT_FOR_TEST}"
-AUTH_BF = "https://login.microsoftonline.com/botframework.com"
-
-
-async def diag_msal(_: web.Request) -> web.Response:
-    log.info("Initializing with Entra authority: %s", AUTH_TENANT)
-    try:
-        appc = msal.ConfidentialClientApplication(
-            client_id=APP_ID, client_credential=APP_PASSWORD, authority=AUTH_TENANT
-        )
-        token = appc.acquire_token_for_client(scopes=SCOPE)
-        ok = "access_token" in token
-        payload = {"ok": ok, "keys": list(token.keys()), "authority": AUTH_TENANT}
-        if not ok:
-            payload["error"] = token
-        return web.json_response(payload, status=200 if ok else 500)
-    except Exception as e:
-        return web.json_response({"ok": False, "exception": str(e)}, status=500)
-
-
-async def diag_msal_bf(_: web.Request) -> web.Response:
-    log.info("Initializing with Entra authority: %s", AUTH_BF)
-    try:
-        appc = msal.ConfidentialClientApplication(
-            client_id=APP_ID, client_credential=APP_PASSWORD, authority=AUTH_BF
-        )
-        token = appc.acquire_token_for_client(scopes=SCOPE)
-        ok = "access_token" in token
-        payload = {"ok": ok, "keys": list(token.keys()), "authority": AUTH_BF}
-        if not ok:
-            payload["error"] = token
-        return web.json_response(payload, status=200 if ok else 500)
-    except Exception as e:
-        return web.json_response({"ok": False, "exception": str(e)}, status=500)
-
-
-# --- Diagnóstico clave: ¿el adapter considera válido tu AppId? ---
-# Esto detecta de inmediato si el password está vacío/typo o si el factory no carga la config.
-from botbuilder.integration.aiohttp.configuration_service_client_credential_factory import \
-    ConfigurationServiceClientCredentialFactory
-
+# --- authcfg: confirma si el adapter reconoce tu AppId ---
 async def diag_authcfg(_: web.Request) -> web.Response:
+    """
+    Usa el mismo objeto de autenticación que CloudAdapter para verificar
+    si 'aud' (AppId) sería reconocido como válido.
+    """
     try:
-        factory = ConfigurationServiceClientCredentialFactory(configuration={
-            "MicrosoftAppId": APP_ID,
-            "MicrosoftAppPassword": APP_PASSWORD,
-            "MicrosoftAppTenantId": APP_TENANT,
-            "MicrosoftAppType": APP_TYPE,
-        })
-        is_valid = await factory.is_valid_app_id(APP_ID)
-        pwd_len = len(APP_PASSWORD or "")
-        return web.json_response({
+        # El SDK expone el provider internamente; hacemos una comprobación lo más parecida posible
+        provider = auth._inner._credentials_factory.credential_provider  # type: ignore
+        is_valid = await provider.is_valid_appid(APP_ID) if APP_ID else False
+        payload = {
             "is_valid_app_id": bool(is_valid),
-            "app_id_matches_env": APP_ID is not None,
-            "password_len": pwd_len,
+            "app_id_matches_env": True,
+            "app_id": APP_ID,
             "app_type": APP_TYPE,
-            "tenant": APP_TENANT or "(none)",
-        })
+            "tenant": TENANT_ID or "(none)",
+            "password_len": len(APP_PASSWORD or ""),
+            "oauth_scope": OAUTH_SCOPE,
+        }
+        return web.json_response(payload)
+    except Exception as e:
+        return web.json_response({"ok": False, "exception": str(e)}, status=500)
+
+
+# --- Diagnóstico simple del backend N2SQL (para descartar NLU) ---
+import aiohttp
+N2SQL_URL = os.getenv("N2SQL_URL", "")
+
+async def diag_nlu(_: web.Request) -> web.Response:
+    url = (N2SQL_URL or os.getenv("N2SQL_URL".upper(), "") or "").rstrip("/")
+    if not url:
+        return web.json_response({"ok": False, "error": "N2SQL_URL missing"}, status=500)
+    try:
+        async with aiohttp.ClientSession() as s:
+            for path in ("/health", "/"):
+                try:
+                    async with s.get(f"{url}{path}", timeout=10) as r:
+                        body = await r.text()
+                        return web.json_response({"ok": r.status < 400, "status": r.status, "path": path, "body": body[:2000]})
+                except Exception:
+                    continue
+        return web.json_response({"ok": False, "error": "No responde /health ni /"}, status=502)
     except Exception as e:
         return web.json_response({"ok": False, "exception": str(e)}, status=500)
 
@@ -242,33 +208,9 @@ app = web.Application()
 app.router.add_post("/api/messages", messages)
 app.router.add_get("/health", health)
 app.router.add_get("/diag/env", diag_env)
-app.router.add_get("/diag/msal", diag_msal)
-app.router.add_get("/diag/msal-bf", diag_msal_bf)
 app.router.add_get("/diag/authcfg", diag_authcfg)
+app.router.add_get("/diag/nlu", diag_nlu)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     web.run_app(app, host="0.0.0.0", port=port)
-
-# --- Diagnóstico del NLU/N2SQL detrás del bot ---
-import aiohttp, os
-
-N2SQL_URL = os.getenv("N2SQL_URL", os.getenv("N2SQL_URL".upper(), "")) or os.getenv("N2SQL_URL", "")
-
-async def diag_nlu(_: web.Request) -> web.Response:
-    url = N2SQL_URL.rstrip("/")
-    if not url:
-        return web.json_response({"ok": False, "error": "N2SQL_URL missing"}, status=500)
-    try:
-        # Primero /health, si no existe probamos /
-        async with aiohttp.ClientSession() as s:
-            for path in ("/health", "/"):
-                try:
-                    async with s.get(f"{url}{path}", timeout=10) as r:
-                        body = await r.text()
-                        return web.json_response({"ok": r.status < 400, "status": r.status, "path": path, "body": body[:4000]})
-                except Exception:
-                    continue
-        return web.json_response({"ok": False, "error": "No responde /health ni /"}, status=502)
-    except Exception as e:
-        return web.json_response({"ok": False, "exception": str(e)}, status=500)
