@@ -8,7 +8,7 @@ from botbuilder.core import TurnContext
 from botbuilder.schema import Activity
 from botframework.connector.auth import MicrosoftAppCredentials
 
-# IMPORTS CORRECTOS: CloudAdapter y Auth vienen del paquete integration.aiohttp
+# CloudAdapter y Auth (aiohttp)
 from botbuilder.integration.aiohttp import CloudAdapter
 from botbuilder.integration.aiohttp.configuration_bot_framework_authentication import (
     ConfigurationBotFrameworkAuthentication,
@@ -35,39 +35,50 @@ log = logging.getLogger("teams-gateway")
 # =========================
 # Helpers de configuración
 # =========================
-def _force_camelcase_env():
+def resolve_secret_preferring_camel(camel_key: str, upper_key: str, default: str = "") -> str:
     """
-    Forzamos que las CAMELCASE sean la fuente de verdad.
-    Si quedaron variables en MAYÚSCULAS (MICROSOFT_*), NO las usamos.
+    Toma primero CAMELCASE; si falta, toma MAYÚSCULAS; si no, default.
+    Además, fija SIEMPRE la camelCase en os.environ con el valor resuelto,
+    para que el adapter la encuentre sin ambigüedad.
     """
-    # Si alguien aún pone mayúsculas, NO las copiamos; queremos usar solo camelCase.
-    # Asegura además scope/tipo por defecto:
+    val = os.getenv(camel_key)
+    if not val:
+        val = os.getenv(upper_key, default)
+        if val:
+            os.environ[camel_key] = val  # fija camelCase
+    return os.getenv(camel_key, default)
+
+
+def enforce_defaults():
+    # Scope correcto hacia el Connector
     os.environ.setdefault("ToChannelFromBotOAuthScope", "https://api.botframework.com/.default")
+    # Recomendación para Teams
     os.environ.setdefault("MicrosoftAppType", "MultiTenant")
 
 
-_force_camelcase_env()
-
-APP_ID = os.getenv("MicrosoftAppId", "")  # el que valida CloudAdapter
+# Resuelve credenciales (preferencia camelCase, fallback MAYÚSCULAS)
+APP_ID = resolve_secret_preferring_camel("MicrosoftAppId", "MICROSOFT_APP_ID")
+APP_PASSWORD = resolve_secret_preferring_camel("MicrosoftAppPassword", "MICROSOFT_APP_PASSWORD")
+TENANT_ID = resolve_secret_preferring_camel("MicrosoftAppTenantId", "MICROSOFT_APP_TENANT_ID")
+APP_TYPE = resolve_secret_preferring_camel("MicrosoftAppType", "MICROSOFT_APP_TYPE")
+enforce_defaults()
 
 # Instancia del bot
 bot = DataTalkBot()
 
-
 # ----------------------
-# Config mínima para ConfigurationBotFrameworkAuthentication
-# (provee .get(key, default) leyendo de os.environ camelCase)
+# Config mínima basada en os.environ para el Auth
 # ----------------------
 class EnvConfiguration:
     def __init__(self, env): self._env = env
     def get(self, key: str, default=None): return self._env.get(key, default)
 
+config = EnvConfiguration(os.environ)
 
 # ==========================
 # Adapter (CloudAdapter) + Auth
 # ==========================
-config = EnvConfiguration(os.environ)
-auth = ConfigurationBotFrameworkAuthentication(config)  # lee MicrosoftAppId/Password, etc. desde ENV
+auth = ConfigurationBotFrameworkAuthentication(config)  # leerá camelCase ya fijadas
 adapter = CloudAdapter(auth)
 
 
@@ -77,12 +88,9 @@ adapter = CloudAdapter(auth)
 async def on_error(context: TurnContext, error: Exception):
     log.error("[BOT ERROR] %s", error, exc_info=True)
     try:
-        await context.send_activity(
-            "Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo."
-        )
+        await context.send_activity("Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo.")
     except Exception as e:
         log.error("[BOT ERROR][send_activity] %s", e, exc_info=True)
-
 
 adapter.on_turn_error = on_error
 
@@ -111,7 +119,7 @@ async def messages(req: web.Request) -> web.Response:
 
     log.info(
         "[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | channel=%s | serviceUrl=%s",
-        APP_ID, recipient_raw, channel_id, service_url,
+        APP_ID or "(empty)", recipient_raw, channel_id, service_url,
     )
     if channel_id == "msteams":
         log.info("[DIAG][msteams] normalized=%s", normalized)
@@ -121,7 +129,7 @@ async def messages(req: web.Request) -> web.Response:
     if target and APP_ID and target != APP_ID:
         log.error("[MISMATCH] Mensaje para botId=%s, pero proceso firma como=%s.", target, APP_ID)
 
-    # Confiar serviceUrl (por si acaso)
+    # Confiar serviceUrl
     try:
         MicrosoftAppCredentials.trust_service_url(service_url)
     except Exception as e:
@@ -141,14 +149,14 @@ async def health(_: web.Request) -> web.Response:
 
 def public_env_snapshot() -> dict:
     keys = [
-        # Las que SÍ deben estar
+        # Las que SÍ debe usar el adapter (camelCase)
         "MicrosoftAppId",
         "MicrosoftAppPassword",
         "MicrosoftAppTenantId",
         "MicrosoftAppType",
         "ToChannelFromBotOAuthScope",
         "PORT",
-        # Para detectar residuos en MAYÚSCULAS (no deberían usarse)
+        # Para detectar residuos en MAYÚSCULAS
         "MICROSOFT_APP_ID",
         "MICROSOFT_APP_PASSWORD",
         "MICROSOFT_APP_TENANT_ID",
@@ -166,8 +174,8 @@ async def diag_env(_: web.Request) -> web.Response:
 
 
 # --- Diagnóstico de token con MSAL (para validar secreto AAD) ---
-TENANT = os.getenv("MicrosoftAppTenantId") or "organizations"
-AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT}"
+TENANT_FOR_TEST = TENANT_ID or "organizations"
+AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT_FOR_TEST}"
 AUTH_BF = "https://login.microsoftonline.com/botframework.com"
 SCOPE = ["https://api.botframework.com/.default"]
 
@@ -176,8 +184,8 @@ async def diag_msal(_: web.Request) -> web.Response:
     log.info("Initializing with Entra authority: %s", AUTH_TENANT)
     try:
         appc = msal.ConfidentialClientApplication(
-            client_id=APP_ID,
-            client_credential=os.getenv("MicrosoftAppPassword", ""),
+            client_id=APP_ID or "",
+            client_credential=APP_PASSWORD or "",
             authority=AUTH_TENANT,
         )
         token = appc.acquire_token_for_client(scopes=SCOPE)
@@ -194,8 +202,8 @@ async def diag_msal_bf(_: web.Request) -> web.Response:
     log.info("Initializing with Entra authority: %s", AUTH_BF)
     try:
         appc = msal.ConfidentialClientApplication(
-            client_id=APP_ID,
-            client_credential=os.getenv("MicrosoftAppPassword", ""),
+            client_id=APP_ID or "",
+            client_credential=APP_PASSWORD or "",
             authority=AUTH_BF,
         )
         token = appc.acquire_token_for_client(scopes=SCOPE)
