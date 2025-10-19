@@ -1,5 +1,6 @@
 # app.py — Teams Gateway (aiohttp + BotFrameworkAdapter, SDK 4.14.x)
-# Normaliza recipient.id (strip "28:") y añade trazas útiles.
+# - Compara recipient.id ~ AppId SOLO en channel 'msteams'
+# - Trazas de diagnóstico útiles
 
 import os
 import logging
@@ -62,7 +63,7 @@ async def on_error(context: TurnContext, error: Exception):
 
 adapter.on_turn_error = on_error
 
-def _normalize_bot_id(raw_id: str | None) -> str | None:
+def _normalize_bot_id_for_teams(raw_id: str | None) -> str | None:
     if not raw_id:
         return raw_id
     return raw_id[3:] if raw_id.startswith("28:") else raw_id
@@ -76,17 +77,24 @@ async def messages(req: web.Request) -> web.Response:
     auth_header = req.headers.get("Authorization", "")
 
     rec_id_raw = getattr(activity.recipient, "id", None)
-    rec_id = _normalize_bot_id(rec_id_raw)
     svc_url = getattr(activity, "service_url", None)
     chan_id = getattr(activity, "channel_id", None)
 
-    log.info("[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | normalized=%s | channel=%s | serviceUrl=%s",
-             APP_ID, rec_id_raw, rec_id, chan_id, svc_url)
+    # Diagnóstico base
+    log.info(
+        "[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | channel=%s | serviceUrl=%s",
+        APP_ID, rec_id_raw, chan_id, svc_url
+    )
 
-    # Solo alertamos si tras normalizar aún difiere
-    if rec_id and APP_ID and rec_id != APP_ID:
-        log.error("[MISMATCH] Mensaje para botId=%s, pero proceso firma como=%s. Revisa AppId/secret/manifest.",
-                  rec_id, APP_ID)
+    # SOLO en Teams tiene sentido comparar contra AppId (formato 28:<APP_ID>)
+    if chan_id == "msteams":
+        rec_norm = _normalize_bot_id_for_teams(rec_id_raw)
+        log.info("[DIAG][msteams] normalized=%s", rec_norm)
+        if rec_norm and APP_ID and rec_norm != APP_ID:
+            log.error(
+                "[MISMATCH][msteams] Mensaje para botId=%s, pero proceso firma como=%s. Revisa AppId/secret/manifest.",
+                rec_norm, APP_ID
+            )
 
     async def aux_func(turn_context: TurnContext):
         await bot.on_turn(turn_context)
