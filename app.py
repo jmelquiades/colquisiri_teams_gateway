@@ -1,24 +1,24 @@
-# app.py — Teams Gateway (aiohttp + CloudAdapter, SDK 4.15.x)
-
-import os
-import json
+# app.py — Teams Gateway (aiohttp + CloudAdapter, SDK 4.16.x)
 import logging
-from typing import Optional
+import os
+from typing import Dict, Any
 
 from aiohttp import web
 
-# --- Bot Framework SDK (4.15.x) ---
-from botbuilder.core import CloudAdapter, TurnContext, MessageFactory
-from botbuilder.integration.aiohttp import ConfigurationBotFrameworkAuthentication
+from botbuilder.core import CloudAdapter, TurnContext
 from botbuilder.schema import Activity
-from botframework.connector.auth import MicrosoftAppCredentials
+from botbuilder.integration.aiohttp import ConfigurationBotFrameworkAuthentication
 
-# --- Tu bot (debe exponer on_turn / on_message_activity) ---
+import jwt  # solo para inspeccionar claims sin validar firma
+import msal  # para diags de token hacia BF
+
+# Tu bot
 from bot import DataTalkBot
+from conectores.bf_msft_comandos import acquire_bf_token, trust_service_url
 
-# =========================
-# Logging
-# =========================
+# ----------------------
+# Logging básico
+# ----------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(levelname)s:%(name)s:%(message)s",
@@ -31,20 +31,24 @@ log = logging.getLogger("teams-gateway")
 # =========================
 def _env(name: str, fallback: str = "") -> str:
     """
-    Lee primero MAYÚSCULAS; si no existe, intenta camelCase (compat Render/Azure).
+    Lee primero MAYÚSCULAS; si no existe, intenta camelCase (compat con Render).
     """
-    camel_map = {
-        "MICROSOFT_APP_ID": "MicrosoftAppId",
-        "MICROSOFT_APP_PASSWORD": "MicrosoftAppPassword",
-        "MICROSOFT_APP_TENANT_ID": "MicrosoftAppTenantId",
-        "MICROSOFT_APP_TYPE": "MicrosoftAppType",
-        "TO_CHANNEL_FROM_BOT_OAUTH_SCOPE": "ToChannelFromBotOAuthScope",
-        "APPLICATIONINSIGHTS_CONNECTION_STRING": "APPLICATIONINSIGHTS_CONNECTION_STRING",
-    }
-    return os.getenv(name, os.getenv(camel_map.get(name, ""), fallback))
+    return os.getenv(
+        name,
+        os.getenv(
+            {
+                "MICROSOFT_APP_ID": "MicrosoftAppId",
+                "MICROSOFT_APP_PASSWORD": "MicrosoftAppPassword",
+                "MICROSOFT_APP_TENANT_ID": "MicrosoftAppTenantId",
+                "MICROSOFT_APP_TYPE": "MicrosoftAppType",
+                "TO_CHANNEL_FROM_BOT_OAUTH_SCOPE": "ToChannelFromBotOAuthScope",
+            }.get(name, ""),
+            fallback,
+        ),
+    )
 
 
-def public_env_snapshot() -> dict:
+def public_env_snapshot() -> Dict[str, Any]:
     keys = [
         "MICROSOFT_APP_ID",
         "MICROSOFT_APP_PASSWORD",
@@ -61,39 +65,45 @@ def public_env_snapshot() -> dict:
     for k in keys:
         v = _env(k)
         out[k] = "SET(***masked***)" if v else "MISSING"
-    out["EFFECTIVE_APP_ID"] = _env("MICROSOFT_APP_ID", "")
-    out["EFFECTIVE_TENANT"] = _env("MICROSOFT_APP_TENANT_ID", "")
-    out["EFFECTIVE_APP_TYPE"] = _env("MICROSOFT_APP_TYPE", "")
+
+    app_id = _env("MICROSOFT_APP_ID")
+    app_type = (_env("MICROSOFT_APP_TYPE") or "SingleTenant").strip()
+    tenant = _env("MICROSOFT_APP_TENANT_ID")
+
+    out["EFFECTIVE_APP_ID"] = app_id or "(none)"
+    out["EFFECTIVE_TENANT"] = tenant or "(none)"
+    out["EFFECTIVE_APP_TYPE"] = app_type or "(none)"
     return out
 
 
-# =========================
-# CloudAdapter + Auth (explícito)
-# =========================
-APP_ID = _env("MICROSOFT_APP_ID", "")
-APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
-TENANT_ID = _env("MICROSOFT_APP_TENANT_ID", "")
-APP_TYPE = (_env("MICROSOFT_APP_TYPE", "") or "SingleTenant").strip()
-OAUTH_SCOPE = _env("TO_CHANNEL_FROM_BOT_OAUTH_SCOPE", "") or "https://api.botframework.com"
+# =====================================
+# Credenciales (AppId / Password / Tenant)
+# =====================================
+APP_ID = _env("MICROSOFT_APP_ID")
+APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD")
+APP_TENANT = _env("MICROSOFT_APP_TENANT_ID")  # requerido si SingleTenant
+APP_TYPE = _env("MICROSOFT_APP_TYPE") or "SingleTenant"
+OAUTH_SCOPE = _env("TO_CHANNEL_FROM_BOT_OAUTH_SCOPE") or "https://api.botframework.com"
 
-# Construimos un objeto "config" para el auth del SDK que lea de nuestro _env
-class _Cfg(dict):
-    def get(self, key: str, default: Optional[str] = None):  # SDK lo usa
-        m = {
-            "MicrosoftAppId": APP_ID,
-            "MicrosoftAppPassword": APP_PASSWORD,
-            "MicrosoftAppType": APP_TYPE,
-            "MicrosoftAppTenantId": TENANT_ID,
-            "ToChannelFromBotOAuthScope": OAUTH_SCOPE,
-        }
-        return m.get(key, default)
+# Config dict explícito para ConfigurationBotFrameworkAuthentication
+auth_config: Dict[str, str] = {
+    "MicrosoftAppId": APP_ID or "",
+    "MicrosoftAppPassword": APP_PASSWORD or "",
+    "MicrosoftAppType": APP_TYPE,
+    "ToChannelFromBotOAuthScope": OAUTH_SCOPE,
+}
+if APP_TYPE.lower().startswith("single") and APP_TENANT:
+    auth_config["MicrosoftAppTenantId"] = APP_TENANT
 
-CONFIG = _Cfg()
-auth = ConfigurationBotFrameworkAuthentication(CONFIG)  # lee del _Cfg, no del env del proceso
+# Adapter moderno (CloudAdapter)
+auth = ConfigurationBotFrameworkAuthentication(configuration=auth_config)
 adapter = CloudAdapter(auth)
 
 # Instancia del bot
 bot = DataTalkBot()
+
+# Últimas claims vistas (para /diag/claims)
+LAST_CLAIMS: Dict[str, Any] = {}
 
 
 # ==========================
@@ -102,16 +112,19 @@ bot = DataTalkBot()
 async def on_error(context: TurnContext, error: Exception):
     log.error("[BOT ERROR] %s", error, exc_info=True)
     try:
-        await context.send_activity("Ocurrió un error procesando tu mensaje.")
+        await context.send_activity(
+            "Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo."
+        )
     except Exception as e:
         log.error("[BOT ERROR][send_activity] %s", e, exc_info=True)
+
 
 adapter.on_turn_error = on_error
 
 
-# ==========================
-# Handlers HTTP (aiohttp)
-# ==========================
+# ==========
+# Handlers
+# ==========
 async def messages(req: web.Request) -> web.Response:
     if "application/json" not in req.headers.get("Content-Type", ""):
         return web.Response(status=415, text="Content-Type must be application/json")
@@ -120,31 +133,54 @@ async def messages(req: web.Request) -> web.Response:
     activity: Activity = Activity().deserialize(body)
     auth_header = req.headers.get("Authorization", "")
 
-    # Diagnóstico mínimo de entrada
-    rec_raw = getattr(activity.recipient, "id", "")
+    # ---- Diagnóstico útil en cada llegada ----
+    recipient_raw = getattr(activity.recipient, "id", "")
     channel_id = getattr(activity, "channel_id", "")
     service_url = getattr(activity, "service_url", "")
-    normalized = rec_raw.split("28:")[-1] if channel_id == "msteams" and rec_raw.startswith("28:") else rec_raw
+
+    normalized = recipient_raw
+    if channel_id == "msteams" and isinstance(recipient_raw, str) and recipient_raw.startswith("28:"):
+        normalized = recipient_raw.split("28:")[-1]
 
     log.info(
         "[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | channel=%s | serviceUrl=%s",
-        APP_ID, rec_raw, channel_id, service_url
+        APP_ID,
+        recipient_raw,
+        channel_id,
+        service_url,
     )
     if channel_id == "msteams":
         log.info("[DIAG][msteams] normalized=%s", normalized)
 
-    # Confiar en el serviceUrl antes de responder (Teams exige esto)
+    # Confiar serviceUrl para respuestas salientes
+    trust_service_url(service_url)
+
+    # Inspeccionar claims del Authorization: Bearer ... (solo lectura, sin validar)
     try:
-        MicrosoftAppCredentials.trust_service_url(service_url)
+        token = (auth_header or "").split("Bearer ", 1)[-1].strip()
+        if token:
+            claims = jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
+            LAST_CLAIMS.clear()
+            for k in ("iss", "aud", "appid", "azp", "tid", "ver"):
+                LAST_CLAIMS[k] = claims.get(k)
+            log.info(
+                "[JWT] iss=%s | aud=%s | appid=%s | azp=%s | tid=%s | ver=%s",
+                LAST_CLAIMS.get("iss"),
+                LAST_CLAIMS.get("aud"),
+                LAST_CLAIMS.get("appid"),
+                LAST_CLAIMS.get("azp"),
+                LAST_CLAIMS.get("tid"),
+                LAST_CLAIMS.get("ver"),
+            )
     except Exception as e:
-        log.warning("trust_service_url(%s) falló: %s", service_url, e)
+        log.warning("No se pudieron leer claims JWT: %s", e)
 
     async def aux(turn_context: TurnContext):
         await bot.on_turn(turn_context)
 
-    # Orden correcto (auth_header, activity, callback)
+    # Orden: auth_header, activity, callback
     await adapter.process_activity(auth_header, activity, aux)
-    return web.Response(status=201)
+    return web.Response(status=202)
 
 
 async def health(_: web.Request) -> web.Response:
@@ -155,50 +191,39 @@ async def diag_env(_: web.Request) -> web.Response:
     return web.json_response(public_env_snapshot())
 
 
-# --- authcfg: confirma si el adapter reconoce tu AppId ---
-async def diag_authcfg(_: web.Request) -> web.Response:
-    """
-    Usa el mismo objeto de autenticación que CloudAdapter para verificar
-    si 'aud' (AppId) sería reconocido como válido.
-    """
+# --- Diagnóstico de token con MSAL (para validar credenciales AAD/BF) ---
+SCOPE = ["https://api.botframework.com/.default"]
+
+
+async def diag_msal(_: web.Request) -> web.Response:
+    # Token contra TU tenant (SingleTenant) o 'organizations' (MultiTenant)
+    tenant = APP_TENANT or "organizations"
+    authority = f"https://login.microsoftonline.com/{tenant}"
     try:
-        # El SDK expone el provider internamente; hacemos una comprobación lo más parecida posible
-        provider = auth._inner._credentials_factory.credential_provider  # type: ignore
-        is_valid = await provider.is_valid_appid(APP_ID) if APP_ID else False
-        payload = {
-            "is_valid_app_id": bool(is_valid),
-            "app_id_matches_env": True,
-            "app_id": APP_ID,
-            "app_type": APP_TYPE,
-            "tenant": TENANT_ID or "(none)",
-            "password_len": len(APP_PASSWORD or ""),
-            "oauth_scope": OAUTH_SCOPE,
-        }
-        return web.json_response(payload)
+        appc = msal.ConfidentialClientApplication(
+            client_id=APP_ID,
+            client_credential=APP_PASSWORD,
+            authority=authority,
+        )
+        token = appc.acquire_token_for_client(scopes=SCOPE)
+        ok = "access_token" in token
+        payload = {"ok": ok, "keys": [k for k in token.keys()], "authority": authority}
+        if not ok:
+            payload["error"] = token
+        return web.json_response(payload, status=200 if ok else 500)
     except Exception as e:
         return web.json_response({"ok": False, "exception": str(e)}, status=500)
 
 
-# --- Diagnóstico simple del backend N2SQL (para descartar NLU) ---
-import aiohttp
-N2SQL_URL = os.getenv("N2SQL_URL", "")
+async def diag_bf(_: web.Request) -> web.Response:
+    # Atajo con helper (igual objetivo que /diag/msal)
+    tenant = APP_TENANT or "organizations"
+    res = acquire_bf_token(APP_ID, APP_PASSWORD, tenant)
+    return web.json_response(res, status=200 if res.get("has_access_token") else 500)
 
-async def diag_nlu(_: web.Request) -> web.Response:
-    url = (N2SQL_URL or os.getenv("N2SQL_URL".upper(), "") or "").rstrip("/")
-    if not url:
-        return web.json_response({"ok": False, "error": "N2SQL_URL missing"}, status=500)
-    try:
-        async with aiohttp.ClientSession() as s:
-            for path in ("/health", "/"):
-                try:
-                    async with s.get(f"{url}{path}", timeout=10) as r:
-                        body = await r.text()
-                        return web.json_response({"ok": r.status < 400, "status": r.status, "path": path, "body": body[:2000]})
-                except Exception:
-                    continue
-        return web.json_response({"ok": False, "error": "No responde /health ni /"}, status=502)
-    except Exception as e:
-        return web.json_response({"ok": False, "exception": str(e)}, status=500)
+
+async def diag_claims(_: web.Request) -> web.Response:
+    return web.json_response({"last_claims": LAST_CLAIMS or "(none)"})
 
 
 # ==========
@@ -208,9 +233,13 @@ app = web.Application()
 app.router.add_post("/api/messages", messages)
 app.router.add_get("/health", health)
 app.router.add_get("/diag/env", diag_env)
-app.router.add_get("/diag/authcfg", diag_authcfg)
-app.router.add_get("/diag/nlu", diag_nlu)
+app.router.add_get("/diag/msal", diag_msal)
+app.router.add_get("/diag/bf", diag_bf)
+app.router.add_get("/diag/claims", diag_claims)
 
+# ==========
+# Main
+# ==========
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     web.run_app(app, host="0.0.0.0", port=port)
