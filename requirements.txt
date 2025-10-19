@@ -15,8 +15,7 @@ packaging==24.1
 botbuilder-core==4.14.3
 botbuilder-schema==4.14.3
 botframework-connector==4.14.3
-botbuilder-integration-aiohttp==4.14.3
 
-# Auth MSAL (diag de token) y pipeline msrest
+# Auth MSAL (diag de token) y msrest
 msal==1.29.0
 msrest==0.6.21
