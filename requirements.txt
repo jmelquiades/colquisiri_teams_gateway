@@ -1,3 +1,4 @@
+# Pila estable (BotBuilder 4.14.x + aiohttp 3.8.x) — evita conflictos de urllib3/aiohttp
 aiohttp==3.8.5
 msal==1.34.0
 
@@ -7,8 +8,8 @@ botbuilder-integration-aiohttp==4.14.7
 botframework-connector==4.14.7
 botframework-streaming==4.14.7
 
-PyJWT==2.8.0
 jsonpickle==1.4.2
 msrest==0.7.1
 urllib3==1.26.20
-requests==2.32.3
+PyJWT==2.8.0
+requests==2.32.5
