@@ -171,9 +171,9 @@ async def messages(req: web.Request) -> web.Response:
             raise
 
     # Orden correcto (auth_header, activity, callback)
-    await adapter.process_activity(auth_header, activity, aux_func)
+    await adapter.process_activity(activity, auth_header, aux_func)
     return web.Response(status=201)
-
+     # Orden correcto (auth_header, activity, callback)
 
 async def health(_: web.Request) -> web.Response:
     return web.json_response({"ok": True})
