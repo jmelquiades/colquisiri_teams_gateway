@@ -1,22 +1,27 @@
-# app.py — Teams Gateway con CloudAdapter (aiohttp, SDK 4.17.x)
+# app.py — Teams Gateway con CloudAdapter (aiohttp, SDK 4.17.x) + Diagnóstico y App Insights
 import os
 import json
 import base64
 import logging
 from aiohttp import web
 
-from botbuilder.core import TurnContext, MessageFactory
+from botbuilder.core import TurnContext, MessageFactory, TelemetryLoggerMiddleware
 from botbuilder.schema import Activity
-
+from botbuilder.integration.aiohttp.cloud_adapter import CloudAdapter
 from botbuilder.integration.aiohttp.configuration_bot_framework_authentication import (
     ConfigurationBotFrameworkAuthentication,
 )
-from botbuilder.integration.aiohttp.cloud_adapter import CloudAdapter
+
+# Telemetría (Application Insights)
+# Docs: ApplicationInsightsTelemetryClient + TelemetryLoggerMiddleware
+# https://learn.microsoft.com/python/api/botbuilder-applicationinsights
+from botbuilder.applicationinsights import ApplicationInsightsTelemetryClient, bot_telemetry_processor
 
 import msal
 
-# ---- Tu bot (debe implementar on_turn / on_message_activity) ----
+# Tu bot
 from bot import DataTalkBot
+
 
 # ----------------------
 # Logging básico
@@ -32,13 +37,14 @@ log = logging.getLogger("teams-gateway")
 # Helpers de configuración
 # =========================
 def _get_env(name: str, fallback: str = "") -> str:
-    # Acepta MAYÚSCULAS y los clásicos camelCase por compatibilidad con Render
+    # Acepta MAYÚSCULAS y camelCase (compat Render)
     return os.getenv(name, os.getenv({
         "MICROSOFT_APP_ID": "MicrosoftAppId",
         "MICROSOFT_APP_PASSWORD": "MicrosoftAppPassword",
         "MICROSOFT_APP_TENANT_ID": "MicrosoftAppTenantId",
         "MICROSOFT_APP_TYPE": "MicrosoftAppType",
         "TO_CHANNEL_SCOPE": "ToChannelFromBotOAuthScope",
+        "APPLICATIONINSIGHTS_CONNECTION_STRING": "APPLICATIONINSIGHTS_CONNECTION_STRING",
     }.get(name, ""), fallback))
 
 
@@ -46,7 +52,7 @@ def public_env_snapshot() -> dict:
     keys = [
         "MICROSOFT_APP_ID", "MICROSOFT_APP_PASSWORD", "MICROSOFT_APP_TENANT_ID", "MICROSOFT_APP_TYPE",
         "MicrosoftAppId", "MicrosoftAppPassword", "MicrosoftAppTenantId", "MicrosoftAppType",
-        "ToChannelFromBotOAuthScope", "PORT",
+        "ToChannelFromBotOAuthScope", "APPLICATIONINSIGHTS_CONNECTION_STRING", "PORT",
     ]
     out = {}
     for k in keys:
@@ -63,23 +69,34 @@ def public_env_snapshot() -> dict:
 # ==========================
 APP_ID = _get_env("MICROSOFT_APP_ID")
 APP_PASSWORD = _get_env("MICROSOFT_APP_PASSWORD")
-APP_TENANT = _get_env("MICROSOFT_APP_TENANT_ID")   # REQUERIDO en SingleTenant
+APP_TENANT = _get_env("MICROSOFT_APP_TENANT_ID")   # REQUERIDO si SingleTenant
 APP_TYPE = _get_env("MICROSOFT_APP_TYPE", "SingleTenant")
 TO_BF_SCOPE = _get_env("TO_CHANNEL_SCOPE", "https://api.botframework.com/.default")
 
 config = {
-    # Los nombres exactos que espera ConfigurationBotFrameworkAuthentication:
     "MicrosoftAppId": APP_ID,
     "MicrosoftAppPassword": APP_PASSWORD,
     "MicrosoftAppTenantId": APP_TENANT,
     "MicrosoftAppType": APP_TYPE,  # SingleTenant | MultiTenant | UserAssignedMSI
     "ToChannelFromBotOAuthScope": TO_BF_SCOPE,
-    # "ChannelService": os.getenv("ChannelService"),  # Solo para nubes soberanas (no lo uses en Azure público)
 }
 
 auth = ConfigurationBotFrameworkAuthentication(configuration=config)
 adapter = CloudAdapter(auth)
 bot = DataTalkBot()
+
+# ==========
+# Telemetría opcional a App Insights
+# ==========
+AI_CONN = _get_env("APPLICATIONINSIGHTS_CONNECTION_STRING")
+if AI_CONN:
+    try:
+        ai_client = ApplicationInsightsTelemetryClient(connection_string=AI_CONN, telemetry_processor=bot_telemetry_processor)
+        # Loguea actividades entrantes/salientes sin PII
+        adapter.use(TelemetryLoggerMiddleware(ai_client, log_personal_information=False))
+        log.info("[AI] Application Insights habilitado")
+    except Exception as e:
+        log.warning("[AI] No se pudo inicializar App Insights: %s", e)
 
 
 # ==========================
@@ -106,7 +123,7 @@ async def messages(req: web.Request) -> web.Response:
     activity: Activity = Activity().deserialize(body)
     auth_header = req.headers.get("Authorization", "")
 
-    # ---- Diagnóstico útil: IDs y Teams ----
+    # ---- Diagnóstico útil
     recipient_raw = getattr(activity.recipient, "id", "")
     channel_id = getattr(activity, "channel_id", "")
     service_url = getattr(activity, "service_url", "")
@@ -120,13 +137,13 @@ async def messages(req: web.Request) -> web.Response:
     if channel_id == "msteams":
         log.info("[DIAG][msteams] normalized=%s", normalized)
 
-    # ---- Dump de claims del JWT entrante (para detectar appid/tid/aud) ----
+    # ---- Dump mínimo de claims del JWT entrante
     if auth_header.startswith("Bearer "):
         try:
             token = auth_header.split(" ", 1)[1]
             parts = token.split(".")
             if len(parts) == 3:
-                padded = parts[1] + "=="  # base64 url-safe padding
+                padded = parts[1] + "=="
                 payload = json.loads(base64.urlsafe_b64decode(padded.encode("utf-8")))
                 iss = payload.get("iss")
                 aud = payload.get("aud")
@@ -140,7 +157,7 @@ async def messages(req: web.Request) -> web.Response:
     async def aux(turn_context: TurnContext):
         await bot.on_turn(turn_context)
 
-    # CloudAdapter en aiohttp: orden = (auth_header, activity, callback)
+    # Orden CloudAdapter: (auth_header, activity, callback)
     await adapter.process_activity(auth_header, activity, aux)
     return web.Response(status=201)
 
@@ -153,7 +170,7 @@ async def diag_env(_: web.Request) -> web.Response:
     return web.json_response(public_env_snapshot())
 
 
-# --- Diagnóstico de token MSAL (útil para validar secreto) ---
+# --- Diagnóstico de token MSAL (para validar secreto) ---
 SCOPE = ["https://api.botframework.com/.default"]
 TENANT_FOR_TEST = _get_env("MICROSOFT_APP_TENANT_ID") or "organizations"
 AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT_FOR_TEST}"
@@ -192,6 +209,32 @@ async def diag_msal_bf(_: web.Request) -> web.Response:
         return web.json_response({"ok": False, "exception": str(e)}, status=500)
 
 
+# --- Diagnóstico clave: ¿el adapter considera válido tu AppId? ---
+# Esto detecta de inmediato si el password está vacío/typo o si el factory no carga la config.
+from botbuilder.integration.aiohttp.configuration_service_client_credential_factory import \
+    ConfigurationServiceClientCredentialFactory
+
+async def diag_authcfg(_: web.Request) -> web.Response:
+    try:
+        factory = ConfigurationServiceClientCredentialFactory(configuration={
+            "MicrosoftAppId": APP_ID,
+            "MicrosoftAppPassword": APP_PASSWORD,
+            "MicrosoftAppTenantId": APP_TENANT,
+            "MicrosoftAppType": APP_TYPE,
+        })
+        is_valid = await factory.is_valid_app_id(APP_ID)
+        pwd_len = len(APP_PASSWORD or "")
+        return web.json_response({
+            "is_valid_app_id": bool(is_valid),
+            "app_id_matches_env": APP_ID is not None,
+            "password_len": pwd_len,
+            "app_type": APP_TYPE,
+            "tenant": APP_TENANT or "(none)",
+        })
+    except Exception as e:
+        return web.json_response({"ok": False, "exception": str(e)}, status=500)
+
+
 # ==========
 # App AIOHTTP
 # ==========
@@ -201,6 +244,7 @@ app.router.add_get("/health", health)
 app.router.add_get("/diag/env", diag_env)
 app.router.add_get("/diag/msal", diag_msal)
 app.router.add_get("/diag/msal-bf", diag_msal_bf)
+app.router.add_get("/diag/authcfg", diag_authcfg)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
