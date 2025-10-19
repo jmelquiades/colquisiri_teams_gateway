@@ -1,20 +1,19 @@
+# === Runtime ===
 fastapi==0.110.0
-uvicorn==0.27.1
+uvicorn==0.29.0
 
+# === MSAL / HTTP ===
 msal==1.34.0
+requests==2.31.0
+aiohttp==3.10.5
 PyJWT==2.8.0
-requests==2.32.5
+python-dotenv==1.0.1
 
-# Bot Builder estable 4.14.x (sin CloudAdapter)
-botbuilder-core==4.14.7
-botbuilder-schema==4.14.7
-botframework-connector==4.14.7
-botframework-streaming==4.14.7
-
-# Dependencias del conector
+# Pin de compatibilidad (evita conflictos con botbuilder 4.14.x)
+urllib3==1.26.20
 jsonpickle==1.4.2
 msrest==0.7.1
-urllib3==1.26.20
 
-# NECESARIO para el cliente HTTP de msrest/botframework
-aiohttp==3.8.5
+# === Bot Framework SDK 4.14.x (lo que ya te funciona) ===
+botbuilder-core==4.14.3
+botbuilder-schema==4.14.3

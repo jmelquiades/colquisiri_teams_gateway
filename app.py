@@ -1,10 +1,9 @@
-# app.py — Teams gateway usando FastAPI + BotFrameworkAdapter (SDK 4.14.x)
-import logging
+# app.py — Gateway Teams con FastAPI + BotFrameworkAdapter (SDK 4.14.x)
 import os
-from typing import Optional
+import json
+import logging
+from typing import Dict, Any
 
-import jwt  # PyJWT
-import msal
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
@@ -12,27 +11,38 @@ from botbuilder.core import (
     TurnContext,
     BotFrameworkAdapter,
     BotFrameworkAdapterSettings,
+    MessageFactory,
 )
 from botbuilder.schema import Activity
 from botframework.connector.auth import MicrosoftAppCredentials
 
-# Tu bot
-from bot import DataTalkBot
+import msal
+import jwt  # PyJWT, para diagnóstico simple sin verificar firma
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
+# =======================
+# Tu bot (echo de prueba)
+# =======================
+class DataTalkBot:
+    async def on_turn(self, turn_context: TurnContext):
+        if turn_context.activity.type == "message":
+            text = (turn_context.activity.text or "").strip()
+            if not text:
+                text = "(mensaje vacío)"
+            await turn_context.send_activity(MessageFactory.text(f"ECO: {text}"))
+
+# ----------------------
+# Logging básico
+# ----------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(levelname)s:%(name)s:%(message)s",
 )
 log = logging.getLogger("teams-gateway")
 
-# -----------------------------------------------------------------------------
-# Helpers ENV
-# -----------------------------------------------------------------------------
+# =========================
+# Helpers de configuración
+# =========================
 def _env(name: str, fallback: str = "") -> str:
-    # Admite mayúsculas y camelCase (compatibilidad con Render)
     return os.getenv(
         name,
         os.getenv(
@@ -41,80 +51,58 @@ def _env(name: str, fallback: str = "") -> str:
                 "MICROSOFT_APP_PASSWORD": "MicrosoftAppPassword",
                 "MICROSOFT_APP_TENANT_ID": "MicrosoftAppTenantId",
                 "MICROSOFT_APP_TYPE": "MicrosoftAppType",
-                "TO_CHANNEL_FROM_BOT_OAUTH_SCOPE": "ToChannelFromBotOAuthScope",
             }.get(name, ""),
             fallback,
         ),
     )
 
-def public_env_snapshot() -> dict:
+def public_env_snapshot() -> Dict[str, Any]:
     keys = [
         "MICROSOFT_APP_ID",
         "MICROSOFT_APP_PASSWORD",
         "MICROSOFT_APP_TENANT_ID",
         "MICROSOFT_APP_TYPE",
-        "TO_CHANNEL_FROM_BOT_OAUTH_SCOPE",
         "MicrosoftAppId",
         "MicrosoftAppPassword",
         "MicrosoftAppTenantId",
         "MicrosoftAppType",
-        "ToChannelFromBotOAuthScope",
         "PORT",
     ]
     out = {}
     for k in keys:
         out[k] = "SET(***masked***)" if _env(k) else "MISSING"
-    out["EFFECTIVE_APP_ID"] = _env("MICROSOFT_APP_ID", "")
-    out["EFFECTIVE_TENANT"] = _env("MICROSOFT_APP_TENANT_ID", "")
-    out["EFFECTIVE_APP_TYPE"] = _env("MICROSOFT_APP_TYPE", "") or "MultiTenant"
+    out["EFFECTIVE_APP_ID"] = _env("MICROSOFT_APP_ID")
+    out["EFFECTIVE_TENANT"] = _env("MICROSOFT_APP_TENANT_ID")
+    out["EFFECTIVE_APP_TYPE"] = _env("MICROSOFT_APP_TYPE") or "(not set)"
     return out
 
-# -----------------------------------------------------------------------------
-# Credenciales básicas
-# -----------------------------------------------------------------------------
+# =====================================
+# Credenciales (AppId / Password AAD)
+# =====================================
 APP_ID = _env("MICROSOFT_APP_ID", "")
 APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
-TENANT = _env("MICROSOFT_APP_TENANT_ID", "") or "organizations"
 
-# Adapter clásico (NO CloudAdapter)
+# Adapter clásico 4.14.x (el que ya te funciona)
 adapter = BotFrameworkAdapter(BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD))
-log.info("Adapter: BotFrameworkAdapter 4.14.x (SIN CloudAdapter)")
 
+# Instancia del bot
 bot = DataTalkBot()
 
-# -----------------------------------------------------------------------------
-# Errores globales
-# -----------------------------------------------------------------------------
+# ==========================
+# Manejo global de errores
+# ==========================
 async def on_error(context: TurnContext, error: Exception):
     log.error("[BOT ERROR] %s", error, exc_info=True)
     try:
-        await context.send_activity(
-            "Ocurrió un error procesando tu mensaje. Estamos corrigiéndolo."
-        )
+        await context.send_activity("Ocurrió un error procesando tu mensaje.")
     except Exception as e:
         log.error("[BOT ERROR][send_activity] %s", e, exc_info=True)
 
 adapter.on_turn_error = on_error
 
-# -----------------------------------------------------------------------------
-# Utilitarios de diagnóstico
-# -----------------------------------------------------------------------------
-SCOPE = ["https://api.botframework.com/.default"]
-AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT}"
-AUTH_BF = "https://login.microsoftonline.com/botframework.com"
-
-def _decode_bearer_unverified(authorization_header: str) -> dict:
-    if not authorization_header or not authorization_header.lower().startswith("bearer "):
-        return {}
-    token = authorization_header.split(" ", 1)[1].strip()
-    try:
-        return jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
-    except Exception:
-        return {}
-
-# -----------------------------------------------------------------------------
-# FastAPI app
-# -----------------------------------------------------------------------------
+# ==========
+# FastAPI
+# ==========
 app = FastAPI()
 
 @app.get("/health")
@@ -124,6 +112,12 @@ async def health():
 @app.get("/diag/env")
 async def diag_env():
     return public_env_snapshot()
+
+# --- Diagnósticos MSAL (útiles para validar secreto/alcance) ---
+TENANT = _env("MICROSOFT_APP_TENANT_ID") or "organizations"
+AUTH_TENANT = f"https://login.microsoftonline.com/{TENANT}"
+AUTH_BF = "https://login.microsoftonline.com/botframework.com"
+SCOPE = ["https://api.botframework.com/.default"]
 
 @app.get("/diag/msal")
 async def diag_msal():
@@ -163,6 +157,7 @@ async def diag_msal_bf():
 
 @app.post("/api/messages")
 async def messages(req: Request):
+    # Validación Content-Type simple
     if "application/json" not in req.headers.get("content-type", ""):
         return PlainTextResponse("Content-Type must be application/json", status_code=415)
 
@@ -170,6 +165,7 @@ async def messages(req: Request):
     activity: Activity = Activity().deserialize(body)
     auth_header = req.headers.get("Authorization", "")
 
+    # Diags de llegada
     recipient_raw = getattr(activity.recipient, "id", "")
     channel_id = getattr(activity, "channel_id", "")
     service_url = getattr(activity, "service_url", "")
@@ -180,33 +176,30 @@ async def messages(req: Request):
 
     log.info(
         "[DIAG] Our APP_ID=%s | activity.recipient.id(raw)=%s | channel=%s | serviceUrl=%s",
-        APP_ID, recipient_raw, channel_id, service_url
+        APP_ID, recipient_raw, channel_id, service_url,
     )
     if channel_id == "msteams":
         log.info("[DIAG][msteams] normalized=%s", normalized)
 
-    # JWT entrante (solo para diagnóstico)
-    claims = _decode_bearer_unverified(auth_header)
-    appid = claims.get("appid") or claims.get("azp")
-    tid = claims.get("tid")
-    ver = claims.get("ver")
-    iss = claims.get("iss")
-    aud = claims.get("aud")
-    log.info("[JWT] iss=%s | aud=%s | appid=%s | tid=%s | ver=%s", iss, aud, appid, tid, ver)
+    # (Opcional) log de claims sin verificar — solo para depurar formato del token
+    try:
+        if auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1]
+            claims = jwt.decode(token, options={"verify_signature": False, "verify_aud": False})
+            iss = claims.get("iss")
+            aud = claims.get("aud")
+            appid = claims.get("appid") or claims.get("azp")
+            tid = claims.get("tid")
+            ver = claims.get("ver")
+            log.info("[JWT] iss=%s | aud=%s | appid=%s | tid=%s | ver=%s", iss, aud, appid, tid, ver)
+    except Exception as e:
+        log.warning("[JWT] no se pudieron leer claims sin verificación: %s", e)
 
-    # Mismatch AppId (manifest apuntando a otro bot)
-    target = normalized if channel_id in ("msteams", "skype") else recipient_raw
-    if target and APP_ID and target != APP_ID:
-        log.error(
-            "[MISMATCH] Mensaje para botId=%s, pero proceso firma como=%s. Revisa AppId/secret/manifest.",
-            target, APP_ID
-        )
-
-    # Confiar en serviceUrl para respuestas salientes
+    # MUY IMPORTANTE: confiar en el serviceUrl antes de enviar respuestas
     try:
         MicrosoftAppCredentials.trust_service_url(service_url)
     except Exception as e:
-        log.warning("No se pudo registrar trust_service_url(%s): %s", service_url, e)
+        log.warning("trust_service_url error: %s", e)
 
     async def aux(turn_context: TurnContext):
         try:
@@ -215,6 +208,14 @@ async def messages(req: Request):
             log.error("[BOT ERROR] %s", ex, exc_info=True)
             raise
 
-    # Orden correcto en 4.14.x: (activity, auth_header, callback)
+    # Orden correcto para Adapter 4.14.x: (activity, auth_header, callback)
     await adapter.process_activity(activity, auth_header, aux)
     return Response(status_code=201)
+
+# ==========
+# Main local
+# ==========
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
