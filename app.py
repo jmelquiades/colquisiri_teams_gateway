@@ -15,8 +15,7 @@ from bot import DataTalkBot
 # =========================
 def _env(name: str, fallback: str = "") -> str:
     """
-    Lee primero MAYÚSCULAS; si no existe, intenta camelCase (por compatibilidad
-    con variables ya creadas en Render). Si no, usa fallback.
+    Lee primero MAYÚSCULAS; si no existe, intenta camelCase (por compatibilidad).
     """
     return os.getenv(
         name,
@@ -33,20 +32,20 @@ def _env(name: str, fallback: str = "") -> str:
 
 
 def public_env_snapshot() -> dict:
-    """
-    Snapshot seguro del entorno: indica si existen variables críticas
-    sin revelar sus valores. Útil para /diag/env.
-    """
     keys = [
         "MICROSOFT_APP_ID",
         "MICROSOFT_APP_PASSWORD",
         "MICROSOFT_APP_TENANT_ID",
         "MICROSOFT_APP_TYPE",
+        "MicrosoftAppId",
+        "MicrosoftAppPassword",
+        "MicrosoftAppTenantId",
+        "MicrosoftAppType",
         "PORT",
     ]
     out = {}
     for k in keys:
-        v = _env(k)
+        v = os.getenv(k)
         out[k] = "SET(***masked***)" if v else "MISSING"
     return out
 
@@ -56,6 +55,17 @@ def public_env_snapshot() -> dict:
 # =====================================
 APP_ID = _env("MICROSOFT_APP_ID", "")
 APP_PASSWORD = _env("MICROSOFT_APP_PASSWORD", "")
+TENANT = _env("MICROSOFT_APP_TENANT_ID")  # si está vacío, usaremos organizations en msal diag
+APP_TYPE = _env("MICROSOFT_APP_TYPE", "SingleTenant")
+
+# *** CLAVE: sincroniza también a camelCase para el SDK 4.14 ***
+os.environ.setdefault("MicrosoftAppId", APP_ID)
+os.environ.setdefault("MicrosoftAppPassword", APP_PASSWORD)
+# Para single-tenant es vital que el SDK vea el tenant:
+if TENANT:
+    os.environ.setdefault("MicrosoftAppTenantId", TENANT)
+# AppType ayuda en escenarios enterprise (single vs multi)
+os.environ.setdefault("MicrosoftAppType", APP_TYPE)
 
 # Adapter clásico (estable con SDK 4.14.x)
 adapter = BotFrameworkAdapter(BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD))
@@ -85,28 +95,18 @@ adapter.on_turn_error = on_error
 # ==========
 async def messages(req: web.Request) -> web.Response:
     # Acepta "application/json" y variantes con charset
-    if "application/json" not in (req.headers.get("Content-Type") or ""):
+    if "application/json" not in req.headers.get("Content-Type", ""):
         return web.Response(status=415, text="Content-Type must be application/json")
 
-    try:
-        body = await req.json()
-    except Exception:
-        return web.Response(status=400, text="Invalid JSON body")
-
+    body = await req.json()
     activity = Activity().deserialize(body)
-
-    # Validación básica del Activity
-    if not getattr(activity, "type", None):
-        return web.Response(status=400, text="Invalid activity payload: missing type")
-
     auth_header = req.headers.get("Authorization", "")
 
     async def aux_func(turn_context: TurnContext):
         await bot.on_turn(turn_context)
 
-    # ORDEN CORRECTO para BotFrameworkAdapter (SDK 4.14.x):
-    # activity, auth_header, callback
-    await adapter.process_activity(activity, auth_header, aux_func)
+    # Orden correcto: (auth_header, activity, callback)
+    await adapter.process_activity(auth_header, activity, aux_func)
     return web.Response(status=201)
 
 
@@ -118,9 +118,8 @@ async def diag_env(_: web.Request) -> web.Response:
     return web.json_response(public_env_snapshot())
 
 
-# Diagnóstico de token con MSAL (para validar credenciales AAD)
-TENANT = _env("MICROSOFT_APP_TENANT_ID") or "organizations"
-AUTHORITY = f"https://login.microsoftonline.com/{TENANT}"
+# Diagnóstico de token con MSAL (para validar credenciales AAD de cliente)
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT or 'organizations'}"
 SCOPE = ["https://api.botframework.com/.default"]
 
 
@@ -133,9 +132,18 @@ async def diag_msal(_: web.Request) -> web.Response:
         )
         token = appc.acquire_token_for_client(scopes=SCOPE)
         ok = "access_token" in token
-        payload = {"ok": ok, "keys": list(token.keys())}
+        payload = {
+            "ok": ok,
+            "keys": list(token.keys()),
+            "sdk_env_seen": {
+                "MicrosoftAppId": bool(os.getenv("MicrosoftAppId")),
+                "MicrosoftAppPassword": bool(os.getenv("MicrosoftAppPassword")),
+                "MicrosoftAppTenantId": bool(os.getenv("MicrosoftAppTenantId")),
+                "MicrosoftAppType": bool(os.getenv("MicrosoftAppType")),
+            },
+        }
         if not ok:
-            payload["error"] = token  # unauthorized_client / invalid_client, etc.
+            payload["error"] = token
         return web.json_response(payload, status=200 if ok else 500)
     except Exception as e:
         return web.json_response({"ok": False, "exception": str(e)}, status=500)
